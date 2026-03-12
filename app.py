@@ -1880,34 +1880,43 @@ def save_orders_and_build_ots(
                     break
             title_ml_by_sku[sku] = t
 
-        # Prefijos (SKU base -> Familia) para inferir packs sin Familia (prefijo más largo)
-        _fam_bases = []
+        # Prefijo 6 -> Familia para inferir SKUs sin familia
+        _fam_prefix6 = {}
         try:
-            _fam_bases = [
-                (normalize_sku(k), str(v).strip())
-                for k, v in (familia_map_sku or {}).items()
-                if str(v or "").strip() and str(v).strip().lower() != "nan"
-            ]
-            # Evitar prefijos demasiado cortos que podrían mezclar familias
-            _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
-            _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
-        except Exception:
-            _fam_bases = []
-    def _fam_for_sku(sku: str) -> str:
-            # 1) Familia directa en maestro
-            f = str(familia_map_sku.get(sku, "") or "").strip()
-            if f and f.lower() != "nan":
-                return f
+            fam_counts = {}
+            for k, v in (familia_map_sku or {}).items():
+                base_sku = normalize_sku(k)
+                fam = str(v or "").strip()
+                if not base_sku or len(base_sku) < 6 or not fam or fam.lower() == "nan":
+                    continue
+                pref6 = base_sku[:6]
+                fam_counts.setdefault(pref6, {})
+                fam_counts[pref6][fam] = fam_counts[pref6].get(fam, 0) + 1
 
-            # 2) Fallback: inferir por "prefijo más largo" (packs)
-            # Busca un SKU base del maestro (con familia) que sea prefijo del SKU actual.
-            ssku = normalize_sku(sku)
-            if not ssku:
-                return "Sin Familia"
-            for base_sku, base_fam in _fam_bases:
-                if ssku != base_sku and ssku.startswith(base_sku):
-                    return base_fam
+            for pref6, fam_map in fam_counts.items():
+                _fam_prefix6[pref6] = sorted(
+                    fam_map.items(),
+                    key=lambda kv: (-kv[1], kv[0])
+                )[0][0]
+        except Exception:
+            _fam_prefix6 = {}
+
+    def _fam_for_sku(sku: str) -> str:
+        # 1) Familia directa en maestro
+        f = str(familia_map_sku.get(sku, "") or "").strip()
+        if f and f.lower() != "nan":
+            return f
+
+        # 2) Fallback: usar los primeros 6 dígitos del SKU
+        ssku = normalize_sku(sku)
+        if not ssku:
             return "Sin Familia"
+
+        fam6 = _fam_prefix6.get(ssku[:6], "")
+        if fam6:
+            return fam6
+
+        return "Sin Familia"
 
     dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
 
@@ -2664,18 +2673,17 @@ def page_picking():
             if st.button(label, disabled=disabled, key=f"jump_{ot_id}_{_tid}"):
 
                 try:
-                    c.execute(
-                        "SELECT COALESCE(MIN(defer_rank), 0) FROM picking_tasks WHERE ot_id=? AND status='PENDING'",
-                        (ot_id,)
-                    )
-                    min_rank = c.fetchone()[0] or 0
-                    new_rank = int(min_rank) - 1
-
-                    c.execute(
-                        "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
-                        (new_rank, now_iso(), _tid)
-                    )
-                    conn.commit()
+                    pending_order = [int(x[0]) for x in ordered if str(x[6]) == "PENDING"]
+                    if _tid in pending_order:
+                        idx_sel = pending_order.index(_tid)
+                        rotated = pending_order[idx_sel:] + pending_order[:idx_sel]
+                        base_rank = -len(rotated)
+                        for i, tid_rot in enumerate(rotated):
+                            c.execute(
+                                "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
+                                (base_rank + i, now_iso(), tid_rot)
+                            )
+                        conn.commit()
 
                 except Exception:
                     pass
