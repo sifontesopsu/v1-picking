@@ -1,7 +1,9 @@
 import json
 import math
+import os
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,21 +32,56 @@ BRANCH_NAME = "main"   # cambia a "master" si tu repo usa master
 
 TIMEOUT = 25
 MIN_ROWS_EXPORTADAS = 4000
+SLEEP_SECONDS = 300
+LOCK_FILE_NAME = ".robot_kame_stock.lock"
 
 # Repo = misma carpeta donde está este script
 REPO_DIR = Path(__file__).resolve().parent
 JSON_SALIDA = REPO_DIR / "stock_kame.json"
+LOCK_FILE = REPO_DIR / LOCK_FILE_NAME
 
 
 # =========================
 # UTIL
 # =========================
 def debug(msg):
-    print(f"[DEBUG] {msg}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 def wait(driver, seconds=TIMEOUT):
     return WebDriverWait(driver, seconds)
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.fd = None
+
+    def acquire(self):
+        try:
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(self.fd, str(os.getpid()).encode("utf-8"))
+            os.fsync(self.fd)
+        except FileExistsError:
+            try:
+                pid = self.path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pid = "desconocido"
+            raise RuntimeError(
+                f"Ya existe otro proceso del bot corriendo o quedó un lock colgado: {self.path} (PID: {pid})."
+            )
+
+    def release(self):
+        try:
+            if self.fd is not None:
+                os.close(self.fd)
+        except Exception:
+            pass
+        try:
+            if self.path.exists():
+                self.path.unlink()
+        except Exception:
+            pass
 
 
 # =========================
@@ -53,14 +90,15 @@ def wait(driver, seconds=TIMEOUT):
 def iniciar_driver():
     chrome_options = Options()
 
-    # Visible para depurar. Cuando ya quede estable, descomenta:
-    # chrome_options.add_argument("--headless=new")
-
+    # Oculta el navegador, pero el script sigue mostrando el proceso en PowerShell
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1600,1000")
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("--log-level=3")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
 
     prefs = {
         "download.default_directory": DOWNLOAD_FOLDER,
@@ -228,7 +266,6 @@ def generar_excel(driver):
 # NOTIFICACIONES
 # =========================
 def abrir_campana(driver):
-    debug("Abriendo campana...")
     campana = wait(driver, 20).until(
         EC.element_to_be_clickable(
             (By.XPATH, "//i[contains(@class,'bell')]/ancestor::*[self::a or self::li or self::button][1]")
@@ -297,6 +334,14 @@ def limpiar_sku(valor) -> str:
 
 
 def limpiar_numero(valor):
+    """
+    Corrige casos como:
+    - 20      -> 20
+    - 20.00   -> 20
+    - 2.000   -> 2000
+    - 1.234,56 -> 1234.56
+    - 1,5     -> 1.5
+    """
     if pd.isna(valor):
         return 0
 
@@ -310,8 +355,42 @@ def limpiar_numero(valor):
         return 0
 
     s = s.replace(" ", "")
-    s = s.replace(".", "")
-    s = s.replace(",", ".")
+    s = s.replace("\xa0", "")
+
+    # Mantener solo dígitos, punto, coma y signo
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s:
+        return 0
+
+    tiene_punto = "." in s
+    tiene_coma = "," in s
+
+    if tiene_punto and tiene_coma:
+        # Si la última coma está después del último punto -> formato 1.234,56
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            # Formato 1,234.56
+            s = s.replace(",", "")
+    elif tiene_coma:
+        # Si hay una sola coma y 1-2 dígitos al final, la tratamos como decimal
+        partes = s.split(",")
+        if len(partes) == 2 and len(partes[1]) in (1, 2):
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif tiene_punto:
+        partes = s.split(".")
+        # Si hay un solo punto y 1-2 decimales, lo tratamos como decimal: 20.00
+        if len(partes) == 2 and len(partes[1]) in (1, 2):
+            pass
+        else:
+            # Si parecen separadores de miles: 2.000 / 12.345 / 1.234.567
+            if all(parte.isdigit() for parte in partes if parte != ""):
+                if all(len(parte) == 3 for parte in partes[1:]):
+                    s = "".join(partes)
 
     try:
         num = float(s)
@@ -438,7 +517,7 @@ def guardar_json(payload: dict, path: Path):
 # =========================
 # GIT
 # =========================
-def run_git(args: list[str], cwd: Path) -> str:
+def run_git(args: list[str], cwd: Path, allow_fail: bool = False) -> str:
     cmd = ["git"] + args
     result = subprocess.run(
         cmd,
@@ -449,11 +528,15 @@ def run_git(args: list[str], cwd: Path) -> str:
         errors="replace",
         check=False
     )
-    if result.returncode != 0:
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+
+    if result.returncode != 0 and not allow_fail:
         raise RuntimeError(
-            f"Git falló: {' '.join(cmd)}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            f"Git falló: {' '.join(cmd)}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         )
-    return result.stdout.strip()
+
+    return stdout if stdout else stderr
 
 
 def validar_repo_git(repo_dir: Path):
@@ -463,9 +546,47 @@ def validar_repo_git(repo_dir: Path):
         raise FileNotFoundError(f"La carpeta actual no parece repo git: {repo_dir}")
 
 
-def git_commit_y_push_si_hay_cambios(repo_dir: Path, archivo_relativo: str, mensaje_commit: str, branch_name: str):
+def git_sync_hard(repo_dir: Path, branch_name: str):
+    """
+    Esta función deja la copia del bot alineada con origin/main.
+    Úsala solo en una clonación dedicada al bot.
+    """
+    debug("Git sync: fetch origin...")
+    run_git(["fetch", "origin"], repo_dir)
+
+    debug(f"Git sync: checkout {branch_name}...")
+    run_git(["checkout", branch_name], repo_dir)
+
+    debug(f"Git sync: reset --hard origin/{branch_name} ...")
+    run_git(["reset", "--hard", f"origin/{branch_name}"], repo_dir)
+
+    # Limpia locks o basura típica del bot, pero NO borra archivos útiles del repo
+    try:
+        lock = repo_dir / LOCK_FILE_NAME
+        if lock.exists():
+            lock.unlink()
+    except Exception:
+        pass
+
+
+def git_commit_y_push_resiliente(repo_dir: Path, archivo_relativo: str, payload_nuevo: dict, branch_name: str):
+    """
+    Estrategia:
+    1) add / commit
+    2) push
+    3) si el push falla por non-fast-forward:
+       - fetch + reset --hard a origin/main
+       - comparar JSON remoto actual con payload_nuevo
+       - si son iguales, no subir nada
+       - si son distintos, volver a escribir, add, commit, push
+    """
     debug("Validando repo git...")
     validar_repo_git(repo_dir)
+
+    commit_msg = (
+        f"update stock kame {payload_nuevo['bodega']} "
+        f"{payload_nuevo['updated_at']}"
+    )
 
     debug("git add...")
     run_git(["add", archivo_relativo], repo_dir)
@@ -478,12 +599,43 @@ def git_commit_y_push_si_hay_cambios(repo_dir: Path, archivo_relativo: str, mens
         return False
 
     debug("git commit...")
-    run_git(["commit", "-m", mensaje_commit], repo_dir)
+    run_git(["commit", "-m", commit_msg], repo_dir)
 
     debug(f"git push origin {branch_name} ...")
-    run_git(["push", "origin", branch_name], repo_dir)
+    try:
+        run_git(["push", "origin", branch_name], repo_dir)
+        return True
+    except Exception as e:
+        msg = str(e).lower()
+        if ("non-fast-forward" not in msg) and ("fetch first" not in msg) and ("failed to push some refs" not in msg):
+            raise
 
-    return True
+        debug("Push rechazado por remoto. Re-sincronizando y reintentando una vez...")
+
+        git_sync_hard(repo_dir, branch_name)
+
+        payload_remoto = cargar_json_existente(JSON_SALIDA)
+        if payload_equivalente_sin_fecha(payload_remoto, payload_nuevo):
+            debug("Después de sincronizar, el JSON remoto ya equivale al nuevo. No hace falta push.")
+            return False
+
+        guardar_json(payload_nuevo, JSON_SALIDA)
+
+        debug("git add (reintento)...")
+        run_git(["add", archivo_relativo], repo_dir)
+
+        diff_cached_2 = run_git(["diff", "--cached", "--name-only"], repo_dir)
+        staged_files_2 = [x.strip() for x in diff_cached_2.splitlines() if x.strip()]
+        if archivo_relativo not in staged_files_2:
+            debug("Tras reintento no hubo cambios staged. No se hace push.")
+            return False
+
+        debug("git commit (reintento)...")
+        run_git(["commit", "-m", commit_msg + " retry"], repo_dir)
+
+        debug("git push final...")
+        run_git(["push", "origin", branch_name], repo_dir)
+        return True
 
 
 # =========================
@@ -496,6 +648,10 @@ def ejecutar_ciclo():
         debug(f"JSON salida: {JSON_SALIDA}")
 
         validar_repo_git(REPO_DIR)
+
+        # MUY IMPORTANTE:
+        # Este bot debe correr en una clonación dedicada, no en la carpeta donde desarrollas.
+        git_sync_hard(REPO_DIR, BRANCH_NAME)
 
         driver = iniciar_driver()
         login(driver)
@@ -513,8 +669,8 @@ def ejecutar_ciclo():
         if not archivo_descargado:
             raise RuntimeError("No se detectó un inventariobodega_*.xlsx nuevo en Descargas.")
 
-        print("\nOK - Descarga completada")
-        print("Archivo final:", archivo_descargado)
+        debug("OK - Descarga completada")
+        debug(f"Archivo final: {archivo_descargado}")
 
         payload_nuevo = excel_a_payload_stock(
             ruta_excel=archivo_descargado,
@@ -526,35 +682,29 @@ def ejecutar_ciclo():
         payload_anterior = cargar_json_existente(JSON_SALIDA)
 
         if payload_equivalente_sin_fecha(payload_anterior, payload_nuevo):
-            print("\nSIN CAMBIOS - El stock nuevo es equivalente al actual.")
-            print("No se sobrescribe ni se hace push.")
+            debug("SIN CAMBIOS - El stock nuevo es equivalente al actual.")
+            debug("No se sobrescribe ni se hace push.")
             return
 
         guardar_json(payload_nuevo, JSON_SALIDA)
 
-        print("\nOK - JSON generado")
-        print("JSON final:", JSON_SALIDA)
-        print("Bodega:", payload_nuevo["bodega"])
-        print("Rows read:", payload_nuevo["rows_read"])
-        print("Rows exported:", payload_nuevo["rows_exported"])
+        debug("OK - JSON generado")
+        debug(f"JSON final: {JSON_SALIDA}")
+        debug(f"Bodega: {payload_nuevo['bodega']}")
+        debug(f"Rows read: {payload_nuevo['rows_read']}")
+        debug(f"Rows exported: {payload_nuevo['rows_exported']}")
 
-        commit_msg = (
-            f"update stock kame {payload_nuevo['bodega']} "
-            f"{payload_nuevo['updated_at']}"
-        )
-
-        pushed = git_commit_y_push_si_hay_cambios(
+        pushed = git_commit_y_push_resiliente(
             repo_dir=REPO_DIR,
             archivo_relativo="stock_kame.json",
-            mensaje_commit=commit_msg,
+            payload_nuevo=payload_nuevo,
             branch_name=BRANCH_NAME
         )
 
         if pushed:
-            print("\nOK - Git actualizado")
-            print("Commit y push realizados correctamente.")
+            debug("OK - Git actualizado. Commit y push realizados correctamente.")
         else:
-            print("\nSIN CAMBIOS GIT - No había diferencias reales para subir.")
+            debug("SIN CAMBIOS GIT - No había diferencias reales para subir o remoto ya tenía el mismo contenido.")
 
     finally:
         if driver:
@@ -565,17 +715,23 @@ def ejecutar_ciclo():
 
 
 if __name__ == "__main__":
-    while True:
-        try:
-            print("\n" + "=" * 70)
-            print("INICIO CICLO:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            ejecutar_ciclo()
-            print("FIN CICLO OK")
-        except KeyboardInterrupt:
-            print("\nProceso detenido manualmente por el usuario.")
-            break
-        except Exception as e:
-            print(f"\nFIN CICLO CON ERROR: {e}")
+    lock = SingleInstanceLock(LOCK_FILE)
+    try:
+        lock.acquire()
+        debug("Lock adquirido. Bot iniciado.")
+        while True:
+            try:
+                print("\n" + "=" * 70, flush=True)
+                print("INICIO CICLO:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), flush=True)
+                ejecutar_ciclo()
+                print("FIN CICLO OK", flush=True)
+            except KeyboardInterrupt:
+                print("\nProceso detenido manualmente por el usuario.", flush=True)
+                break
+            except Exception as e:
+                print(f"\nFIN CICLO CON ERROR: {e}", flush=True)
 
-        print("\nEsperando 5 minutos para el próximo ciclo...")
-        time.sleep(300)
+            print(f"\nEsperando {SLEEP_SECONDS // 60} minutos para el próximo ciclo...", flush=True)
+            time.sleep(SLEEP_SECONDS)
+    finally:
+        lock.release()
