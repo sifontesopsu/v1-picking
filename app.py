@@ -60,6 +60,7 @@ CORTES_FILE = "CORTES.xlsx"
 # Debe estar en el repo, en la misma carpeta que app.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PUBLICATIONS_FILE = os.path.join(BASE_DIR, "links_con_imagenes.xlsx")
+STOCK_KAME_FILE = os.path.join(BASE_DIR, "stock_kame.json")
 # =========================
 # SFX (Sistema A: CLICK + OK/ERR) — estable para Chrome/Android
 # =========================
@@ -299,6 +300,75 @@ def to_chile_display(iso_str: str) -> str:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(iso_str)
+
+
+_STOCK_KAME_CACHE = {"path": None, "mtime": None, "data": None}
+
+
+def load_stock_kame(path: str = STOCK_KAME_FILE) -> tuple[dict[str, float], str]:
+    """Carga stock_kame.json desde disco con cache por mtime.
+
+    Espera un JSON con:
+    - updated_at: fecha/hora última actualización
+    - stock: {sku: cantidad}
+    """
+    if not path or not os.path.exists(path):
+        return {}, ""
+
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+
+    cached = _STOCK_KAME_CACHE
+    if cached.get("path") == path and cached.get("mtime") == mtime and cached.get("data") is not None:
+        payload = cached["data"]
+    else:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return {}, ""
+        cached.update({"path": path, "mtime": mtime, "data": payload})
+
+    stock_raw = payload.get("stock") or {}
+    stock_map: dict[str, float] = {}
+    for k, v in stock_raw.items():
+        sku = normalize_sku(k)
+        if not sku:
+            continue
+        try:
+            stock_map[sku] = float(v)
+        except Exception:
+            continue
+
+    updated_at = str(payload.get("updated_at") or "").strip()
+    return stock_map, updated_at
+
+
+def obtener_stock_kame(sku: str, path: str = STOCK_KAME_FILE):
+    stock_map, _ = load_stock_kame(path)
+    sku_n = normalize_sku(sku)
+    if not sku_n:
+        return None
+    return stock_map.get(sku_n)
+
+
+def obtener_fecha_stock_kame(path: str = STOCK_KAME_FILE) -> str:
+    _, updated_at = load_stock_kame(path)
+    return updated_at
+
+
+def format_stock_kame(value) -> str:
+    if value is None:
+        return "N/D"
+    try:
+        num = float(value)
+        if num.is_integer():
+            return f"{int(num):,}".replace(",", ".")
+        return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(value)
 
 
 def normalize_sku(value) -> str:
@@ -2337,6 +2407,23 @@ def page_picking():
 
     st.markdown(f"### Solicitado: {qty_total}")
 
+    try:
+        stock_kame = obtener_stock_kame(sku_expected)
+        fecha_stock_kame = obtener_fecha_stock_kame()
+    except Exception:
+        stock_kame = None
+        fecha_stock_kame = ""
+
+    fecha_stock_label = to_chile_display(fecha_stock_kame) if fecha_stock_kame else "N/D"
+    if stock_kame is None:
+        st.info(f"Stock Kame: N/D · Actualizado: {fecha_stock_label}")
+    elif float(stock_kame) <= 0:
+        st.error(f"Stock Kame: {format_stock_kame(stock_kame)} · Actualizado: {fecha_stock_label}")
+    elif float(stock_kame) < float(qty_total):
+        st.warning(f"Stock Kame: {format_stock_kame(stock_kame)} · Actualizado: {fecha_stock_label}")
+    else:
+        st.success(f"Stock Kame: {format_stock_kame(stock_kame)} · Actualizado: {fecha_stock_label}")
+
     if s["scan_status"] == "ok":
         st.markdown(
             f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}',
@@ -3463,6 +3550,26 @@ def page_admin():
                 other_picker_names = [n for n in picker_names if n != src_name]
                 if not other_picker_names:
                     st.warning("No hay pickeadores destino disponibles.")
+
+                    with st.expander("➕ Crear pickeadores destino", expanded=True):
+                        new_picker_name = st.text_input(
+                            "Nombre del nuevo pickeador (ej: P2)",
+                            value="P2",
+                            key="adm_new_picker_name"
+                        )
+                        if st.button("Crear pickeador", key="adm_create_picker_btn"):
+                            nn = (new_picker_name or "").strip()
+                            if not nn:
+                                st.error("Ingresa un nombre válido.")
+                            else:
+                                nn = nn.upper()
+                                try:
+                                    conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (nn,))
+                                    conn.commit()
+                                    st.success(f"{nn} creado. Ya puedes repartir tareas.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"No se pudo crear el pickeador: {e}")
                 else:
                     dests = st.multiselect("Pickeadores destino", other_picker_names, default=other_picker_names, key="adm_reassign_dests")
                     if not dests:
