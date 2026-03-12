@@ -1,10 +1,10 @@
 {
-  "updated_at": "2026-03-12 15:13:00",
-  "source_file": "inventariobodega_12-03-2026 18_06_30.xlsx",
+  "updated_at": "2026-03-12 15:18:49",
+  "source_file": "inventariobodega_12-03-2026 18_12_16.xlsx",
   "source_file_packs": "informeStockPacks.xlsx",
   "bodega": "BODEGA UNIVERSAL",
-  "rows_read": 4992,
-  "rows_exported": 4992,
+  "rows_read": 4991,
+  "rows_exported": 4991,
   "rows_exported_packs": 1041,
   "stock": {
     "110601002005": 8,
@@ -1036,7 +1036,6 @@
     "140904002000": 45,
     "110100013015": 1,
     "110100013020": 2,
-    "130806005000": 1,
     "900402002010": 2,
     "900402002005": 6,
     "900402002000": 11,
