@@ -3555,29 +3555,87 @@ def page_admin():
             st.write(f"**Seleccionadas:** {n_sel}")
 
             if n_sel > 0:
-                other_picker_names = [n for n in picker_names if n != src_name]
-                if not other_picker_names:
-                    st.warning("No hay pickeadores destino disponibles.")
+                def _suggest_next_picker_name(existing_names: list[str]) -> str:
+                    nums = []
+                    for pname in existing_names:
+                        m = re.fullmatch(r"P(\d+)", str(pname or "").strip().upper())
+                        if m:
+                            nums.append(int(m.group(1)))
+                    next_n = (max(nums) + 1) if nums else 2
+                    return f"P{next_n}"
 
-                    with st.expander("➕ Crear pickeadores destino", expanded=True):
+                with st.expander("➕ Crear pickeadores destino", expanded=(len(picker_names) <= 1)):
+                    c_new1, c_new2 = st.columns([2, 1])
+                    with c_new1:
                         new_picker_name = st.text_input(
                             "Nombre del nuevo pickeador (ej: P2)",
-                            value="P2",
+                            value=_suggest_next_picker_name(picker_names),
                             key="adm_new_picker_name"
                         )
-                        if st.button("Crear pickeador", key="adm_create_picker_btn"):
-                            nn = (new_picker_name or "").strip()
-                            if not nn:
-                                st.error("Ingresa un nombre válido.")
-                            else:
-                                nn = nn.upper()
-                                try:
-                                    conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (nn,))
+                    with c_new2:
+                        qty_new_pickers = st.number_input(
+                            "Cuántos crear",
+                            min_value=1,
+                            max_value=20,
+                            value=1,
+                            step=1,
+                            key="adm_new_picker_qty"
+                        )
+
+                    if st.button("Crear pickeador(es)", key="adm_create_picker_btn"):
+                        base_name = (new_picker_name or "").strip().upper()
+                        if not base_name:
+                            st.error("Ingresa un nombre válido.")
+                        else:
+                            created_names = []
+                            try:
+                                if qty_new_pickers == 1:
+                                    cur = conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (base_name,))
                                     conn.commit()
-                                    st.success(f"{nn} creado. Ya puedes repartir tareas.")
+                                    if getattr(cur, "rowcount", 0) == 0:
+                                        st.warning(f"{base_name} ya existía.")
+                                    else:
+                                        created_names.append(base_name)
+                                else:
+                                    m = re.fullmatch(r"([A-Z]+)(\d+)", base_name)
+                                    if m:
+                                        prefix = m.group(1)
+                                        start_n = int(m.group(2))
+                                    else:
+                                        prefix = base_name
+                                        start_n = 1
+
+                                    for i in range(int(qty_new_pickers)):
+                                        pname = f"{prefix}{start_n + i}"
+                                        cur = conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (pname,))
+                                        if getattr(cur, "rowcount", 0) > 0:
+                                            created_names.append(pname)
+                                    conn.commit()
+
+                                if created_names:
+                                    st.success(f"Creados: {', '.join(created_names)}. Ya puedes repartir tareas.")
                                     st.rerun()
-                                except Exception as e:
-                                    st.error(f"No se pudo crear el pickeador: {e}")
+                                else:
+                                    st.warning("No se creó ningún pickeador nuevo. Revisa si esos nombres ya existían.")
+                            except Exception as e:
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                                st.error(f"No se pudo crear el pickeador: {e}")
+
+                try:
+                    c.execute("SELECT id, name FROM pickers ORDER BY id")
+                    pickers_rows_live = c.fetchall()
+                except Exception:
+                    pickers_rows_live = pickers_rows
+
+                picker_names_live = [pname for _, pname in pickers_rows_live]
+                picker_name_to_id_live = {pname: int(pid) for pid, pname in pickers_rows_live}
+                other_picker_names = [n for n in picker_names_live if n != src_name]
+
+                if not other_picker_names:
+                    st.warning("No hay pickeadores destino disponibles. Crea uno arriba para repartir las tareas.")
                 else:
                     dests = st.multiselect("Pickeadores destino", other_picker_names, default=other_picker_names, key="adm_reassign_dests")
                     if not dests:
