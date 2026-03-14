@@ -3560,39 +3560,22 @@ def page_admin():
                     st.warning("No hay pickeadores destino disponibles.")
 
                     with st.expander("➕ Crear pickeadores destino", expanded=True):
-                        
-                        qty_new = st.number_input(
-                            "Cantidad de pickeadores a crear",
-                            min_value=1,
-                            max_value=10,
-                            value=1,
-                            step=1,
-                            key="adm_new_picker_qty"
+                        new_picker_name = st.text_input(
+                            "Nombre del nuevo pickeador (ej: P2)",
+                            value="P2",
+                            key="adm_new_picker_name"
                         )
-                        if st.button("Crear pickeadores", key="adm_create_picker_btn"):
-                            try:
-                                # obtener pickeadores actuales tipo P#
-                                cur = conn.execute("SELECT name FROM pickers").fetchall()
-                                existing = [r[0] for r in cur]
-                                nums = []
-                                for n in existing:
-                                    if isinstance(n,str) and n.upper().startswith("P"):
-                                        try:
-                                            nums.append(int(n[1:]))
-                                        except:
-                                            pass
-                                start = max(nums) if nums else 1
-                                created=[]
-                                for i in range(1, int(qty_new)+1):
-                                    name=f"P{start+i}"
-                                    conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)",(name,))
-                                    created.append(name)
-                                conn.commit()
-                                st.success(f"Creados: {', '.join(created)}")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"No se pudieron crear pickeadores: {e}")
-
+                        if st.button("Crear pickeador", key="adm_create_picker_btn"):
+                            nn = (new_picker_name or "").strip()
+                            if not nn:
+                                st.error("Ingresa un nombre válido.")
+                            else:
+                                nn = nn.upper()
+                                try:
+                                    conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (nn,))
+                                    conn.commit()
+                                    st.success(f"{nn} creado. Ya puedes repartir tareas.")
+                                    st.rerun()
                                 except Exception as e:
                                     st.error(f"No se pudo crear el pickeador: {e}")
                 else:
