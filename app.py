@@ -951,6 +951,8 @@ def init_db():
     _ensure_col("picking_tasks", "defer_at", "TEXT")
     _ensure_col("picking_tasks", "family", "TEXT")
     _ensure_col("picking_ots", "model", "TEXT")
+    _ensure_col("picking_ots", "batch_key", "TEXT")
+    _ensure_col("picking_ots", "batch_label", "TEXT")
     _ensure_col("picking_incidences", "note", "TEXT")
 
 
@@ -1734,6 +1736,82 @@ def import_sales_excel(file) -> pd.DataFrame:
 
     out = pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
     return out
+def _next_picker_numbers(existing_names: list[str], qty: int) -> list[int]:
+    nums = []
+    for pname in existing_names or []:
+        m = re.fullmatch(r"P(\d+)", str(pname or "").strip().upper())
+        if m:
+            nums.append(int(m.group(1)))
+    start_n = (max(nums) + 1) if nums else 1
+    return list(range(start_n, start_n + int(qty)))
+
+
+def _get_current_picker_names() -> list[str]:
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT name FROM pickers ORDER BY id")
+        rows = [str(r[0]) for r in c.fetchall()]
+    except Exception:
+        rows = []
+    conn.close()
+    return rows
+
+
+def _build_picking_batch_label(source_label: str | None, model: str, picker_names: list[str]) -> str:
+    src = str(source_label or "Manifiesto").strip() or "Manifiesto"
+    picks = ", ".join(picker_names) if picker_names else "Sin pickeadores"
+    model_txt = "Por ventas" if str(model or "VENTAS").upper().strip() == "VENTAS" else "Por SKU"
+    return f"{src} · {model_txt} · {picks}"
+
+
+def _get_picking_batches_summary() -> list[dict]:
+    conn = get_conn()
+    c = conn.cursor()
+    rows = []
+    try:
+        c.execute("""
+            SELECT
+                COALESCE(po.batch_key, po.ot_code, 'SIN_LOTE') AS batch_key,
+                COALESCE(MAX(NULLIF(po.batch_label,'')), MAX(po.ot_code), 'Lote') AS batch_label,
+                MIN(po.created_at) AS created_at,
+                GROUP_CONCAT(DISTINCT pk.name) AS pickers,
+                COUNT(DISTINCT po.id) AS ots,
+                COUNT(DISTINCT oo.order_id) AS orders_count,
+                SUM(CASE WHEN pt.status='PENDING' THEN 1 ELSE 0 END) AS pending_tasks,
+                SUM(CASE WHEN pt.status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) AS done_tasks,
+                COUNT(DISTINCT CASE WHEN po.status='OPEN' THEN po.id END) AS open_ots
+            FROM picking_ots po
+            JOIN pickers pk ON pk.id = po.picker_id
+            LEFT JOIN ot_orders oo ON oo.ot_id = po.id
+            LEFT JOIN picking_tasks pt ON pt.ot_id = po.id
+            GROUP BY COALESCE(po.batch_key, po.ot_code, 'SIN_LOTE')
+            ORDER BY MIN(po.created_at) DESC, batch_key DESC
+        """)
+        for batch_key, batch_label, created_at, pickers, ots, orders_count, pending_tasks, done_tasks, open_ots in c.fetchall():
+            pending_tasks = int(pending_tasks or 0)
+            done_tasks = int(done_tasks or 0)
+            total_tasks = pending_tasks + done_tasks
+            pct = 0.0 if total_tasks == 0 else round((done_tasks * 100.0) / total_tasks, 1)
+            rows.append({
+                "batch_key": str(batch_key),
+                "batch_label": str(batch_label or "Lote"),
+                "created_at": created_at,
+                "pickers": str(pickers or ""),
+                "ots": int(ots or 0),
+                "orders_count": int(orders_count or 0),
+                "pending_tasks": pending_tasks,
+                "done_tasks": done_tasks,
+                "total_tasks": total_tasks,
+                "open_ots": int(open_ots or 0),
+                "progress_pct": pct,
+            })
+    except Exception:
+        rows = []
+    conn.close()
+    return rows
+
+
 def save_orders_and_build_ots(
     sales_df: pd.DataFrame,
     inv_map_sku: dict,
@@ -1973,6 +2051,232 @@ def save_orders_and_build_ots(
     conn.close()
 
 
+def append_orders_and_build_ots(
+    sales_df: pd.DataFrame,
+    inv_map_sku: dict,
+    num_pickers: int,
+    model: str = "VENTAS",
+    familia_map_sku: dict | None = None,
+    source_label: str | None = None,
+):
+    """Agrega una nueva carga de picking sin borrar la tanda actual."""
+    model = (model or "VENTAS").upper().strip()
+    if model not in ("VENTAS", "SKU"):
+        model = "VENTAS"
+
+    familia_map_sku = familia_map_sku or {}
+    sales_df = sales_df.copy()
+    if sales_df.empty:
+        return {"created": False, "reason": "empty", "new_orders": 0, "picker_names": []}
+
+    sales_df["ml_order_id"] = sales_df["ml_order_id"].astype(str).str.strip()
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    try:
+        c.execute("""
+            SELECT DISTINCT TRIM(o.ml_order_id)
+            FROM ot_orders oo
+            JOIN orders o ON o.id = oo.order_id
+        """)
+        existing_loaded = {str(r[0]).strip() for r in c.fetchall() if str(r[0]).strip()}
+    except Exception:
+        existing_loaded = set()
+
+    new_order_ids = [oid for oid in sales_df["ml_order_id"].drop_duplicates().tolist() if str(oid).strip() and str(oid).strip() not in existing_loaded]
+    if not new_order_ids:
+        conn.close()
+        return {"created": False, "reason": "duplicate", "new_orders": 0, "picker_names": []}
+
+    sales_df = sales_df[sales_df["ml_order_id"].isin(new_order_ids)].copy()
+
+    existing_picker_names = _get_current_picker_names()
+    picker_numbers = _next_picker_numbers(existing_picker_names, int(num_pickers))
+    picker_names = [f"P{n}" for n in picker_numbers]
+    batch_key = f"PK-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))}"
+    batch_label = _build_picking_batch_label(source_label, model, picker_names)
+
+    cortes_set = load_cortes_set()
+    order_id_by_ml = {}
+    for ml_order_id, g in sales_df.groupby("ml_order_id"):
+        ml_order_id = str(ml_order_id).strip()
+        buyer = str(g["buyer"].iloc[0]) if "buyer" in g.columns else ""
+        created = now_iso()
+
+        c.execute("SELECT id FROM orders WHERE ml_order_id = ?", (ml_order_id,))
+        row = c.fetchone()
+        if row:
+            order_id = row[0]
+            c.execute("UPDATE orders SET buyer=?, created_at=? WHERE id=?", (buyer, created, order_id))
+            c.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
+        else:
+            c.execute("INSERT INTO orders (ml_order_id, buyer, created_at) VALUES (?,?,?)", (ml_order_id, buyer, created))
+            order_id = c.lastrowid
+
+        order_id_by_ml[ml_order_id] = order_id
+
+        for _, r in g.iterrows():
+            sku = normalize_sku(r["sku_ml"])
+            qty = int(r["qty"])
+            title_ml = str(r.get("title_ml", "") or "").strip()
+            title_tec = inv_map_sku.get(sku, "")
+            title_eff = title_tec if title_tec else title_ml
+            c.execute(
+                "INSERT INTO order_items (order_id, sku_ml, title_ml, title_tec, qty) VALUES (?,?,?,?,?)",
+                (order_id, sku, title_eff, title_tec, qty)
+            )
+
+    picker_ids = []
+    for name in picker_names:
+        c.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (name,))
+        c.execute("SELECT id FROM pickers WHERE name=?", (name,))
+        row = c.fetchone()
+        if row:
+            picker_ids.append(int(row[0]))
+
+    ot_ids = []
+    for pid in picker_ids:
+        c.execute(
+            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at, model, batch_key, batch_label) VALUES (?,?,?,?,?,?,?,?)",
+            ("", pid, "OPEN", now_iso(), None, model, batch_key, batch_label)
+        )
+        ot_id = c.lastrowid
+        ot_code = f"OT{ot_id:06d}"
+        c.execute("UPDATE picking_ots SET ot_code=? WHERE id=?", (ot_code, ot_id))
+        ot_ids.append(ot_id)
+
+    unique_orders = sales_df[["ml_order_id"]].drop_duplicates().reset_index(drop=True)
+    assignments = {}
+    for idx, row in unique_orders.iterrows():
+        ot_id = ot_ids[idx % len(ot_ids)]
+        assignments[str(row["ml_order_id"]).strip()] = ot_id
+
+    for ml_order_id, ot_id in assignments.items():
+        order_id = order_id_by_ml[ml_order_id]
+        c.execute("INSERT INTO ot_orders (ot_id, order_id) VALUES (?,?)", (ot_id, order_id))
+
+    if model == "VENTAS":
+        for ot_id in ot_ids:
+            c.execute("""
+                SELECT oi.sku_ml,
+                       COALESCE(NULLIF(oi.title_tec,''), oi.title_ml) AS title,
+                       MAX(COALESCE(oi.title_tec,'')) AS title_tec_any,
+                       SUM(oi.qty) as total
+                FROM ot_orders oo
+                JOIN order_items oi ON oi.order_id = oo.order_id
+                WHERE oo.ot_id = ?
+                GROUP BY oi.sku_ml, title
+                ORDER BY CAST(oi.sku_ml AS INTEGER), oi.sku_ml
+            """, (ot_id,))
+            rows = c.fetchall()
+            for sku, title, title_tec_any, total in rows:
+                if sku in cortes_set:
+                    c.execute(
+                        "INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, created_at) VALUES (?,?,?,?,?,?)",
+                        (ot_id, sku, title, title_tec_any, int(total), now_iso())
+                    )
+                else:
+                    c.execute("""
+                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode, family)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None, None))
+
+        conn.commit()
+        conn.close()
+        return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_label": batch_label}
+
+    dfw = sales_df.copy()
+    dfw["sku_ml"] = dfw["sku_ml"].map(normalize_sku)
+    dfw = dfw[dfw["sku_ml"].ne("")].copy()
+
+    title_ml_by_sku = {}
+    if "title_ml" in dfw.columns:
+        for sku, g in dfw.groupby("sku_ml"):
+            t = ""
+            for v in g["title_ml"].tolist():
+                v = str(v or "").strip()
+                if v and v.lower() != "nan":
+                    t = v
+                    break
+            title_ml_by_sku[sku] = t
+
+    _fam_prefix6 = {}
+    try:
+        fam_counts = {}
+        for k, v in (familia_map_sku or {}).items():
+            base_sku = normalize_sku(k)
+            fam = str(v or "").strip()
+            if not base_sku or len(base_sku) < 6 or not fam or fam.lower() == "nan":
+                continue
+            pref6 = base_sku[:6]
+            fam_counts.setdefault(pref6, {})
+            fam_counts[pref6][fam] = fam_counts[pref6].get(fam, 0) + 1
+        for pref6, fam_map in fam_counts.items():
+            _fam_prefix6[pref6] = sorted(fam_map.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    except Exception:
+        _fam_prefix6 = {}
+
+    def _fam_for_sku(sku: str) -> str:
+        f = str(familia_map_sku.get(sku, "") or "").strip()
+        if f and f.lower() != "nan":
+            return f
+        ssku = normalize_sku(sku)
+        if not ssku:
+            return "Sin Familia"
+        fam6 = _fam_prefix6.get(ssku[:6], "")
+        if fam6:
+            return fam6
+        return "Sin Familia"
+
+    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
+    grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
+    grp["qty"] = grp["qty"].astype(int)
+
+    fam_weights = grp.groupby("family")["qty"].sum().to_dict()
+    fam_list = sorted(fam_weights.items(), key=lambda x: x[1], reverse=True)
+    ot_load = {ot_id: 0 for ot_id in ot_ids}
+    ot_fams = {ot_id: [] for ot_id in ot_ids}
+    for fam, w in fam_list:
+        target_ot = min(ot_load.items(), key=lambda kv: kv[1])[0]
+        ot_fams[target_ot].append(fam)
+        ot_load[target_ot] += int(w or 0)
+
+    for ot_id in ot_ids:
+        fams = ot_fams.get(ot_id, [])
+        if not fams:
+            continue
+        sub = grp[grp["family"].isin(fams)].copy()
+        try:
+            sub["sku_int"] = sub["sku_ml"].map(lambda x: int(x) if str(x).isdigit() else 10**18)
+            sub = sub.sort_values(["family", "sku_int", "sku_ml"], ascending=[True, True, True])
+        except Exception:
+            sub = sub.sort_values(["family", "sku_ml"], ascending=[True, True])
+
+        for _, r in sub.iterrows():
+            fam = str(r["family"])
+            sku = str(r["sku_ml"])
+            total = int(r["qty"] or 0)
+            title_tec = inv_map_sku.get(sku, "") or ""
+            title_ml = title_ml_by_sku.get(sku, "") or ""
+            title_eff = title_tec.strip() if title_tec.strip() else title_ml.strip()
+            if sku in cortes_set:
+                c.execute(
+                    "INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, created_at) VALUES (?,?,?,?,?,?)",
+                    (ot_id, sku, title_eff, title_tec, total, now_iso())
+                )
+            else:
+                c.execute("""
+                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode, family)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (ot_id, sku, title_eff, title_tec, total, 0, "PENDING", None, None, fam))
+
+    conn.commit()
+    conn.close()
+    return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_label": batch_label}
+
+
+
 # =========================
 # UI: LOBBY APP (MODO)
 # =========================
@@ -2055,46 +2359,81 @@ def page_app_lobby():
     st.caption("Escanea etiquetas y cuenta paquetes; evita duplicados.")
 def page_import(inv_map_sku: dict, familia_map_sku: dict):
     st.header("Importar ventas")
-    # Bloqueo duro: no permitir cargar otra tanda si hay una en curso
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        c.execute("SELECT COUNT(1) FROM picking_ots WHERE status='OPEN'")
-        open_ots = int(c.fetchone()[0] or 0)
-        c.execute("SELECT COUNT(1) FROM picking_tasks WHERE status='PENDING'")
-        pending_tasks = int(c.fetchone()[0] or 0)
-    except Exception:
-        open_ots, pending_tasks = 0, 0
-    conn.close()
 
-    if open_ots > 0 or pending_tasks > 0:
-        st.warning("⚠️ Ya hay una tanda de Picking en curso. Para cargar otra, ve a **Administrador** y reinicia/borra la tanda actual.")
-        return
+    if st.session_state.get("picking_import_flash"):
+        st.success(st.session_state.get("picking_import_flash"))
+        st.session_state["picking_import_flash"] = ""
+
+    batches = _get_picking_batches_summary()
+    if batches:
+        st.subheader("Tandas de picking activas")
+        cols = st.columns(min(3, len(batches)))
+        for i, batch in enumerate(batches):
+            with cols[i % len(cols)]:
+                with st.container(border=True):
+                    st.markdown(f"**{batch['batch_label']}**")
+                    st.caption(f"Creada: {to_chile_display(batch['created_at'])}")
+                    total = int(batch.get('total_tasks', 0) or 0)
+                    done = int(batch.get('done_tasks', 0) or 0)
+                    pct = float(batch.get('progress_pct', 0.0) or 0.0)
+                    st.progress(min(max(pct / 100.0, 0.0), 1.0))
+                    st.caption(f"{done}/{total} tareas resueltas · {pct:.1f}%")
+                    st.write(f"**Pickeadores:** {batch.get('pickers') or '-'}")
+                    a, b = st.columns(2)
+                    a.metric("Ventas", int(batch.get('orders_count', 0) or 0))
+                    b.metric("OTs abiertas", int(batch.get('open_ots', 0) or 0))
+        st.divider()
 
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
-    num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
+    num_pickers = st.number_input("Cantidad de pickeadores nuevos para esta carga", min_value=1, max_value=20, value=3 if batches else 5, step=1)
     model_pick = st.radio("Elegir modelo", ["Por ventas", "Por sku"], horizontal=True)
 
+    next_names = [f"P{n}" for n in _next_picker_numbers(_get_current_picker_names(), int(num_pickers))]
+    st.info(f"Esta carga creará: **{', '.join(next_names)}**")
+
+    source_label = ""
     if origen == "Excel Mercado Libre":
         file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
         if not file:
             st.info("Sube el Excel de ventas.")
             return
+        source_label = getattr(file, "name", "Excel ML")
         sales_df = import_sales_excel(file)
     else:
         pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ml_pdf")
         if not pdf_file:
             st.info("Sube el PDF.")
             return
+        source_label = getattr(pdf_file, "name", "Manifiesto PDF")
         sales_df = parse_manifest_pdf(pdf_file)
 
     st.subheader("Vista previa")
     st.dataframe(sales_df.head(30))
 
-    if st.button("Cargar y generar OTs"):
+    action_label = "Agregar carga y generar nuevas OTs" if batches else "Cargar y generar OTs"
+    if st.button(action_label):
         model = "VENTAS" if model_pick.startswith("Por ventas") else "SKU"
-        save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
-        st.success("OTs creadas. Anda a Picking y selecciona P1, P2, ...")
+        if batches:
+            result = append_orders_and_build_ots(
+                sales_df,
+                inv_map_sku,
+                int(num_pickers),
+                model=model,
+                familia_map_sku=familia_map_sku,
+                source_label=source_label,
+            )
+            if not result.get("created"):
+                if result.get("reason") == "duplicate":
+                    st.warning("No se agregó una nueva tanda porque todas las ventas de este archivo ya estaban cargadas en la corrida actual.")
+                else:
+                    st.warning("No se pudo crear una nueva tanda con este archivo.")
+            else:
+                st.session_state["picking_import_flash"] = f"Nueva tanda creada: {', '.join(result.get('picker_names', []))}. Ya puedes ir a Picking."
+                st.rerun()
+        else:
+            save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
+            st.session_state["picking_import_flash"] = "OTs creadas. Anda a Picking y selecciona P1, P2, ..."
+            st.rerun()
 
 
 # =========================
@@ -3878,16 +4217,186 @@ def _s2_close_manifest(mid: int):
     conn.commit()
     conn.close()
 
-def _s2_create_new_manifest() -> int:
-    """Creates a new ACTIVE manifest and returns its id."""
+def _s2_create_new_manifest(status: str = 'ACTIVE') -> int:
+    """Crea un lote/manifiesto nuevo.
+    En la operación actual, confirmar carga = entrar directo a producción.
+    """
     _s2_create_tables()
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
+    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES(?, ?);", (str(status or 'ACTIVE').upper(), _s2_now_iso()))
     mid = int(c.lastrowid)
     conn.commit()
     conn.close()
     return mid
+
+
+def _s2_manifest_has_content(mid: int) -> bool:
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    sales = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+    items = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+    labels = int(c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+    pages = int(c.execute("SELECT COUNT(*) FROM s2_page_assign WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+    files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
+    conn.close()
+    has_files = bool(files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))
+    return any([sales, items, labels, pages, has_files])
+
+
+def _s2_list_work_manifests():
+    return _s2_list_open_manifests()
+
+
+def _s2_list_open_manifests():
+    _s2_migrate_staged_to_active()
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute("SELECT id, status, created_at FROM s2_manifests WHERE status='ACTIVE' ORDER BY created_at, id;").fetchall()
+    out = []
+    for mid, status, created_at in rows:
+        mesas = [int(r[0]) for r in c.execute("SELECT DISTINCT mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY mesa;", (int(mid),)).fetchall() if r[0] is not None]
+        sales_total = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+        sales_pending = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status!='DONE';", (int(mid),)).fetchone()[0] or 0)
+        items_total = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+        items_pending = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='PENDING';", (int(mid),)).fetchone()[0] or 0)
+        files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
+        out.append({
+            'id': int(mid),
+            'status': str(status),
+            'created_at': str(created_at or ''),
+            'mesas': mesas,
+            'mesas_text': _s2_mesas_text_from_list(mesas),
+            'lot_label': '',
+            'sales_total': sales_total,
+            'sales_pending': sales_pending,
+            'items_total': items_total,
+            'items_pending': items_pending,
+            'control_name': str(files[0] or '') if files else '',
+            'labels_name': str(files[1] or '') if files else '',
+            'has_content': bool(sales_total or items_total or mesas or (files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))),
+        })
+    conn.close()
+    for mf in out:
+        mf['lot_label'] = _s2_lot_label(int(mf['id']))
+    return out
+
+
+def _s2_get_locked_mesas(exclude_mid: int | None = None):
+    _s2_migrate_staged_to_active()
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    if exclude_mid is None:
+        rows = c.execute("""SELECT DISTINCT p.mesa
+                            FROM s2_page_assign p
+                            JOIN s2_manifests m ON m.id = p.manifest_id
+                            WHERE m.status='ACTIVE'
+                            ORDER BY p.mesa;""").fetchall()
+    else:
+        rows = c.execute("""SELECT DISTINCT p.mesa
+                            FROM s2_page_assign p
+                            JOIN s2_manifests m ON m.id = p.manifest_id
+                            WHERE m.status='ACTIVE' AND p.manifest_id<>?
+                            ORDER BY p.mesa;""", (int(exclude_mid),)).fetchall()
+    conn.close()
+    return [int(r[0]) for r in rows if r[0] is not None]
+
+
+def _s2_next_global_mesa_block(default_count: int = 3, exclude_mid: int | None = None):
+    locked = _s2_get_locked_mesas(exclude_mid=exclude_mid)
+    start = int(max(locked) + 1) if locked else 1
+    return start, max(1, int(default_count or 1))
+
+
+def _s2_find_manifest_by_mesa(mesa: int):
+    _s2_migrate_staged_to_active()
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute("""SELECT p.manifest_id
+                       FROM s2_page_assign p
+                       JOIN s2_manifests m ON m.id = p.manifest_id
+                       WHERE m.status='ACTIVE' AND p.mesa=?
+                       ORDER BY p.manifest_id DESC
+                       LIMIT 1;""", (int(mesa),)).fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+
+def _s2_delete_manifest(mid: int):
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    mid = int(mid)
+    for tbl in ['s2_dispatch', 's2_pack_ship', 's2_packing', 's2_labels', 's2_items', 's2_sales', 's2_page_assign', 's2_files']:
+        c.execute(f"DELETE FROM {tbl} WHERE manifest_id=?;", (mid,))
+    c.execute("DELETE FROM s2_manifests WHERE id=?;", (mid,))
+    conn.commit()
+    conn.close()
+
+
+def _s2_migrate_staged_to_active():
+    """Compatibilidad: cualquier manifiesto STAGED con contenido pasa a ACTIVE.
+    Los STAGED vacíos de versiones anteriores se ignoran.
+    """
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute("SELECT id FROM s2_manifests WHERE status='STAGED';").fetchall()
+    changed = False
+    for (mid,) in rows:
+        mid = int(mid)
+        has_content = bool(c.execute("SELECT 1 FROM s2_sales WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
+        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_items WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
+        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_page_assign WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
+        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_labels WHERE manifest_id=? LIMIT 1;", (mid,)).fetchone())
+        has_content = has_content or bool(c.execute("SELECT 1 FROM s2_files WHERE manifest_id=? AND ((control_name IS NOT NULL AND TRIM(control_name)!='') OR (labels_name IS NOT NULL AND TRIM(labels_name)!=''));", (mid,)).fetchone())
+        if has_content:
+            c.execute("UPDATE s2_manifests SET status='ACTIVE' WHERE id=?;", (mid,))
+            changed = True
+    if changed:
+        conn.commit()
+    conn.close()
+
+
+def _s2_find_empty_active_manifest():
+    _s2_migrate_staged_to_active()
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute("SELECT id FROM s2_manifests WHERE status='ACTIVE' ORDER BY id DESC;").fetchall()
+    out = None
+    for (mid,) in rows:
+        mid = int(mid)
+        if not _s2_manifest_has_content(mid):
+            out = mid
+            break
+    conn.close()
+    return out
+
+
+def _s2_mesas_text_from_list(mesas: list[int]) -> str:
+    mesas = sorted({int(m) for m in (mesas or []) if m is not None})
+    if not mesas:
+        return "Sin mesas"
+    if len(mesas) == 1:
+        return f"Mesa {mesas[0]}"
+    return f"Mesas {mesas[0]} a {mesas[-1]}"
+
+
+def _s2_lot_label(mid: int) -> str:
+    _s2_migrate_staged_to_active()
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute("SELECT id FROM s2_manifests WHERE status='ACTIVE' ORDER BY created_at, id;").fetchall()
+    active_ids = [int(r[0]) for r in rows]
+    idx = active_ids.index(int(mid)) + 1 if int(mid) in active_ids else None
+    mesas = [int(r[0]) for r in c.execute("SELECT DISTINCT mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY mesa;", (int(mid),)).fetchall() if r[0] is not None]
+    conn.close()
+    block = _s2_mesas_text_from_list(mesas)
+    return f"Lote {idx} · {block}" if idx else block
 
 
 
@@ -4751,6 +5260,149 @@ def _s2_auto_assign_pages(mid:int, num_mesas:int=10):
     conn.close()
     return len(pages)
 
+def _s2_next_mesa_block(mid: int, default_count: int = 3):
+    assigns = _s2_get_assignments(mid)
+    if not assigns:
+        return 1, int(default_count)
+    mesas = sorted({int(m) for _, m in assigns if m is not None})
+    mesas_count = int(len(mesas) or default_count)
+    next_start = int(max(mesas) + 1) if mesas else 1
+    return next_start, mesas_count
+
+
+def _s2_auto_assign_specific_pages(mid: int, pages: list[int], start_mesa: int = 1, mesas_count: int = 3):
+    pages = [int(p) for p in pages or []]
+    if not pages:
+        return 0
+    mesas_count = max(1, int(mesas_count or 1))
+    start_mesa = max(1, int(start_mesa or 1))
+    conn = get_conn()
+    c = conn.cursor()
+    for i, p in enumerate(sorted(set(pages))):
+        mesa = start_mesa + (i % mesas_count)
+        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
+                     VALUES(?,?,?)
+                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (mid, p, mesa))
+    conn.commit()
+    conn.close()
+    return len(set(pages))
+
+
+def _s2_build_assignment_preview(pages: list[int], start_mesa: int = 1, mesas_count: int = 3):
+    pages = sorted({int(p) for p in (pages or [])})
+    mesas_count = max(1, int(mesas_count or 1))
+    start_mesa = max(1, int(start_mesa or 1))
+    preview = []
+    for i, p in enumerate(pages):
+        preview.append({"Página": int(p), "Mesa": int(start_mesa + (i % mesas_count))})
+    return preview
+
+
+def _s2_append_labels(mid: int, labels_name: str, labels_bytes: bytes):
+    pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
+    try:
+        txt = labels_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        txt = str(labels_bytes)
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    prev = c.execute("SELECT labels_name FROM s2_files WHERE manifest_id=?;", (mid,)).fetchone()
+    prev_name = str(prev[0] or "").strip() if prev else ""
+    merged_name = labels_name if not prev_name else f"{prev_name} + {labels_name}"
+
+    c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
+                 VALUES(?, ?, ?, ?)
+                 ON CONFLICT(manifest_id) DO UPDATE SET
+                    labels_name=excluded.labels_name,
+                    updated_at=excluded.updated_at;""", (mid, labels_bytes, merged_name, _s2_now_iso()))
+
+    for sid in shipment_ids:
+        c.execute("INSERT OR IGNORE INTO s2_labels(manifest_id, shipment_id, raw) VALUES(?,?,NULL);", (mid, str(sid)))
+
+    if pack_to_ship:
+        for pack_id, ship_id in pack_to_ship.items():
+            c.execute("INSERT OR REPLACE INTO s2_pack_ship(manifest_id, pack_id, shipment_id) VALUES(?,?,?);", (mid, str(pack_id), str(ship_id)))
+        try:
+            c.execute("""UPDATE s2_sales
+                           SET shipment_id = (
+                               SELECT ps.shipment_id FROM s2_pack_ship ps
+                               WHERE ps.manifest_id=s2_sales.manifest_id AND ps.pack_id=s2_sales.pack_id
+                           )
+                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL AND pack_id!='';""", (mid,))
+        except Exception:
+            pass
+
+    if sale_to_ship:
+        try:
+            for sale_id, ship_id in sale_to_ship.items():
+                c.execute("""UPDATE s2_sales
+                             SET shipment_id=?
+                             WHERE manifest_id=? AND sale_id=? AND (shipment_id IS NULL OR shipment_id='');""",
+                          (str(ship_id), mid, str(sale_id)))
+        except Exception:
+            pass
+
+    import re
+    blocks = re.split(r"\^XA", txt)
+    for b in blocks:
+        if not b.strip():
+            continue
+        raw_block = "^XA" + b
+
+        ship = None
+        jm = re.search(r'"id"\s*:\s*"(\d{8,15})"', raw_block)
+        if jm:
+            ship = jm.group(1)
+        if not ship:
+            nums = re.findall(r"\d{10,15}", raw_block)
+            if nums:
+                nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
+                ship = nums_sorted[0]
+        if not ship:
+            continue
+
+        c.execute("""UPDATE s2_labels SET raw=? WHERE manifest_id=? AND shipment_id=?;""", (raw_block, mid, str(ship)))
+        info = _s2_parse_label_raw_info(raw_block)
+        if not info:
+            continue
+        customer = _s2_clean_person_text(info.get("destinatario"), 70)
+        destino_parts = []
+        dom = _s2_clean_person_text(info.get("domicilio"), 120)
+        city = _s2_clean_person_text(info.get("ciudad_destino"), 80)
+        if dom:
+            destino_parts.append(dom)
+        if city:
+            destino_parts.append(city)
+        destino = " - ".join([p for p in destino_parts if p]) if destino_parts else None
+        destino = _s2_clean_person_text(destino, 160) if destino else None
+        comuna = _s2_clean_person_text(info.get("comuna"), 60)
+        ciudad_dest = _s2_clean_person_text(info.get("ciudad_destino"), 80)
+        fields, params = [], []
+        if customer:
+            fields.append("customer=?")
+            params.append(customer)
+        if destino:
+            fields.append("destino=?")
+            params.append(destino)
+        if comuna:
+            fields.append("comuna=?")
+            params.append(comuna)
+        if ciudad_dest:
+            fields.append("ciudad_destino=?")
+            params.append(ciudad_dest)
+        if fields:
+            params.extend([mid, str(ship)])
+            c.execute(f"""UPDATE s2_sales
+                             SET {', '.join(fields)}
+                             WHERE manifest_id=? AND shipment_id=?;""", tuple(params))
+
+    conn.commit()
+    conn.close()
+    return len(shipment_ids)
+
+
 def _s2_get_assignments(mid:int):
     conn=get_conn()
     c=conn.cursor()
@@ -4769,7 +5421,7 @@ def _s2_set_assignment(mid:int, page_no:int, mesa:int):
     conn.close()
 
 def _s2_create_corridas(mid:int):
-    # apply mesa from page assignments to sales
+    # apply mesa from page assignments to sales y liberar a producción
     conn=get_conn()
     c=conn.cursor()
     c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=?;", (mid,))
@@ -4786,6 +5438,7 @@ def _s2_create_corridas(mid:int):
                      SET mesa=?, status='PENDING', opened_at=NULL, closed_at=NULL
                      WHERE manifest_id=? AND sale_id=?;""", (mesa, mid, sale_id))
         updated += 1
+    c.execute("UPDATE s2_manifests SET status='ACTIVE' WHERE id=?;", (int(mid),))
     conn.commit()
     conn.close()
     return updated
@@ -4875,31 +5528,35 @@ def _s2_close_sale(mid:int, sale_id:str):
 
 def page_sorting_upload(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
+    _s2_migrate_staged_to_active()
     st.title("Sorting - Carga y Corridas")
 
-    lots = _s2_get_open_manifests()
-    if lots:
-        rows = []
-        for lot in lots:
-            s = lot.get("stats", {}) or {}
-            rows.append({
-                "Lote": f"Lote {lot['idx']}",
-                "Mesas": _s2_mesas_text(lot.get("mesas") or []),
-                "Ventas": int(s.get("ventas", 0) or 0),
-                "Avance ventas": f"{int(s.get('sales_done', 0) or 0)}/{int(s.get('sales_total', 0) or 0)}",
+    open_manifests = _s2_list_open_manifests()
+    locked_mesas_all = _s2_get_locked_mesas()
+
+    if st.session_state.get("s2_upload_flash"):
+        st.success(st.session_state.get("s2_upload_flash"))
+        st.session_state["s2_upload_flash"] = ""
+
+    if open_manifests:
+        resumen = []
+        for mf in open_manifests:
+            progreso = f"{max(0, mf['sales_total'] - mf['sales_pending'])}/{mf['sales_total']}" if mf['sales_total'] else "0/0"
+            resumen.append({
+                "Lote": mf["lot_label"],
+                "Mesas": mf["mesas_text"],
+                "Ventas": mf["sales_total"],
+                "Avance ventas": progreso,
+                "Control": mf["control_name"] or "-",
+                "Etiquetas": mf["labels_name"] or "-",
             })
-        with st.expander("Lotes abiertos", expanded=True):
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+        with st.expander("Lotes activos", expanded=True):
+            st.dataframe(resumen, use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay lotes activos todavía. Carga el primer Control + Etiquetas para comenzar.")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Ventas activas", sum(int((lot.get('stats') or {}).get('ventas', 0) or 0) for lot in lots))
-    c2.metric("Items", sum(int((lot.get('stats') or {}).get('items', 0) or 0) for lot in lots))
-    c3.metric("Etiquetas", sum(int((lot.get('stats') or {}).get('etiquetas', 0) or 0) for lot in lots))
-    c4.metric("Envíos únicos", sum(int((lot.get('stats') or {}).get('distinct_ship_labels', 0) or 0) for lot in lots))
-    st.caption(f"Mesas bloqueadas por lotes abiertos: {_s2_mesas_text(_s2_get_taken_mesas())}")
-
-    if st.session_state.get("s2_flash_upload"):
-        st.success(st.session_state.pop("s2_flash_upload"))
+    if locked_mesas_all:
+        st.caption(f"Mesas bloqueadas por lotes activos: {', '.join(map(str, locked_mesas_all))}")
 
     mode = st.radio(
         "Modo de carga",
@@ -4915,66 +5572,183 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         with col2:
             zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
 
-        st.caption("La carga no se procesa automáticamente. Sube ambos archivos y confirma.")
-        can_confirm = (pdf is not None and zpl is not None)
-        if st.button("Confirmar carga de Control + Etiquetas", disabled=not can_confirm, use_container_width=True):
-            mid = _s2_create_new_manifest()
-            n_sales = _s2_upsert_control(mid, getattr(pdf, "name", "control.pdf"), pdf.getvalue())
-            n_labels = _s2_upsert_labels(mid, getattr(zpl, "name", "etiquetas.txt"), zpl.getvalue())
-            mesas = _s2_next_block_mesas()
-            _s2_assign_pages_to_mesas(mid, mesas)
-            created = _s2_create_corridas(mid)
-            st.session_state["sorting_manifest_id"] = mid
-            st.session_state["s2_flash_upload"] = (
-                f"{_s2_lot_label(mid)} creado correctamente. Mesas {_s2_mesas_text(mesas)} · "
-                f"Ventas: {int(n_sales or 0)} · Etiquetas: {int(n_labels or 0)} · Corridas: {int(created or 0)}"
-            )
-            for k in ["s2_control_pdf", "s2_labels_txt"]:
-                if k in st.session_state:
-                    del st.session_state[k]
-            st.rerun()
+        st.caption("Al confirmar, la carga entra directo a producción, se le asignan mesas al instante y queda lista para camarero.")
+
+        if pdf is not None or zpl is not None:
+            next_start_preview, mesa_block_preview = _s2_next_global_mesa_block(default_count=3)
+            with st.container(border=True):
+                st.markdown("**Resumen de la carga lista para confirmar**")
+                st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
+                st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
+                st.caption(f"Este nuevo lote usará **{_s2_mesas_text_from_list(list(range(next_start_preview, next_start_preview + mesa_block_preview)))}**.")
+                if pdf is not None:
+                    try:
+                        parsed_preview = _s2_parse_control_pdf(pdf.getvalue())
+                        preview_pages = sorted({int(r.get("page_no") or 1) for r in parsed_preview})
+                    except Exception:
+                        preview_pages = []
+                    if preview_pages:
+                        st.write(f"**Páginas detectadas en el Control:** {len(preview_pages)}")
+                        preview_rows = _s2_build_assignment_preview(preview_pages, start_mesa=next_start_preview, mesas_count=mesa_block_preview)
+                        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No pude previsualizar las páginas del Control antes de confirmar, pero la carga igual se podrá procesar.")
+
+        process_one = st.button(
+            "Confirmar carga de Control + Etiquetas",
+            type="primary",
+            disabled=(pdf is None and zpl is None),
+            key="s2_process_single_upload",
+        )
+
+        if process_one:
+            if pdf is None:
+                st.error("Debes subir el Control (PDF) antes de confirmar la carga.")
+            elif zpl is None:
+                st.error("Debes subir también las Etiquetas (TXT/ZPL) antes de confirmar la carga.")
+            else:
+                pdf_name = getattr(pdf, "name", "control.pdf")
+                pdf_bytes = pdf.getvalue()
+                zpl_name = getattr(zpl, "name", "etiquetas.txt")
+                zpl_bytes = zpl.getvalue()
+
+                target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
+                next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
+                n_sales = _s2_upsert_control(target_mid, pdf_name, pdf_bytes)
+                pages_target = _s2_get_pages(target_mid)
+                _s2_auto_assign_specific_pages(target_mid, pages_target, start_mesa=next_start, mesas_count=mesa_block)
+                n_labels = _s2_upsert_labels(target_mid, zpl_name, zpl_bytes)
+                created = _s2_create_corridas(target_mid)
+
+                lot_label = _s2_lot_label(target_mid)
+                st.session_state["sorting_manifest_id"] = target_mid
+                st.session_state["s2_upload_flash"] = f"{lot_label} cargado correctamente: {n_sales} ventas, {n_labels} etiquetas y {created} corridas activas."
+
+                for k in ("s2_control_pdf", "s2_labels_txt"):
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.rerun()
+
     else:
-        st.info("Sube varios pares Control + Etiquetas. Se crearán lotes separados y simultáneos, cada uno con sus propias mesas.")
+        st.info("📦 Lote: se crea un lote nuevo, se cargan todos los Controles y Etiquetas y se manda directo a producción con mesas exclusivas.")
         col1, col2 = st.columns(2)
         with col1:
             pdfs = st.file_uploader(
-                "Controles (PDF)", type=["pdf"], accept_multiple_files=True, key="s2_control_pdfs"
+                "Controles (PDF) — puedes subir varios",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key="s2_control_pdfs",
             )
         with col2:
             zpls = st.file_uploader(
-                "Etiquetas (TXT/ZPL)", type=["txt", "zpl"], accept_multiple_files=True, key="s2_labels_txts"
+                "Etiquetas (TXT/ZPL) — puedes subir varios",
+                type=["txt", "zpl"],
+                accept_multiple_files=True,
+                key="s2_labels_txts",
             )
-        n_pdfs = len(pdfs or [])
-        n_zpls = len(zpls or [])
-        st.caption(f"Archivos listos: {n_pdfs} Control(es) y {n_zpls} Etiqueta(s). Se emparejan por orden.")
-        pairs = min(n_pdfs, n_zpls)
-        if n_pdfs != n_zpls and (n_pdfs or n_zpls):
-            st.warning("La cantidad de controles y etiquetas no coincide. Solo se procesarán los pares completos.")
-        if st.button("Procesar lote en una sola tanda", disabled=(pairs <= 0), use_container_width=True):
-            created_lots = []
-            for i in range(pairs):
-                mid = _s2_create_new_manifest()
-                pdf = pdfs[i]
-                zpl = zpls[i]
-                n_sales = _s2_upsert_control(mid, getattr(pdf, "name", f"control_{i+1}.pdf"), pdf.getvalue())
-                n_labels = _s2_upsert_labels(mid, getattr(zpl, "name", f"etiquetas_{i+1}.txt"), zpl.getvalue())
-                mesas = _s2_next_block_mesas()
-                _s2_assign_pages_to_mesas(mid, mesas)
-                created = _s2_create_corridas(mid)
-                created_lots.append(f"{_s2_lot_label(mid)} mesas {_s2_mesas_text(mesas)} ({int(created or 0)} corridas)")
-            st.session_state["s2_flash_upload"] = "Cargas creadas: " + " · ".join(created_lots)
-            for k in ["s2_control_pdfs", "s2_labels_txts"]:
-                if k in st.session_state:
-                    del st.session_state[k]
-            st.rerun()
+
+        do_batch = st.button(
+            "Procesar lote en una sola tanda",
+            type="primary",
+            disabled=(not pdfs and not zpls),
+            key="s2_do_batch",
+        )
+
+        if do_batch:
+            if not pdfs:
+                st.error("Debes subir al menos un Control (PDF).")
+            elif not zpls:
+                st.error("Debes subir al menos un archivo de Etiquetas (TXT/ZPL).")
+            else:
+                target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
+                next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
+                total_sales = 0
+                offset = 0
+                control_names = []
+                for i, pdf in enumerate(pdfs):
+                    name = getattr(pdf, "name", f"control_{i+1}.pdf")
+                    control_names.append(name)
+                    if i == 0:
+                        total_sales += int(_s2_upsert_control(target_mid, name, pdf.getvalue()) or 0)
+                    else:
+                        offset = _s2_get_max_page(target_mid)
+                        total_sales += int(_s2_append_control(target_mid, name, pdf.getvalue(), page_offset=offset) or 0)
+                pages_target = _s2_get_pages(target_mid)
+                _s2_auto_assign_specific_pages(target_mid, pages_target, start_mesa=next_start, mesas_count=mesa_block)
+
+                total_labels = 0
+                label_names = []
+                for i, z in enumerate(zpls):
+                    name = getattr(z, "name", f"etiquetas_{i+1}.txt")
+                    label_names.append(name)
+                    if i == 0:
+                        total_labels += int(_s2_upsert_labels(target_mid, name, z.getvalue()) or 0)
+                    else:
+                        total_labels += int(_s2_append_labels(target_mid, name, z.getvalue()) or 0)
+
+                # Unificar nombres visibles
+                try:
+                    conn = get_conn()
+                    c = conn.cursor()
+                    row = c.execute("SELECT control_pdf, labels_txt FROM s2_files WHERE manifest_id=?;", (target_mid,)).fetchone()
+                    c.execute(
+                        """INSERT INTO s2_files(manifest_id, control_pdf, labels_txt, control_name, labels_name, updated_at)
+                             VALUES(?, ?, ?, ?, ?, ?)
+                             ON CONFLICT(manifest_id) DO UPDATE SET
+                                 control_name=excluded.control_name,
+                                 labels_name=excluded.labels_name,
+                                 updated_at=excluded.updated_at;""",
+                        (target_mid, row[0] if row else None, row[1] if row else None, " + ".join(control_names), " + ".join(label_names), _s2_now_iso())
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+
+                created = _s2_create_corridas(target_mid)
+                lot_label = _s2_lot_label(target_mid)
+                st.session_state["s2_upload_flash"] = f"{lot_label} cargado correctamente: {total_sales} ventas, {total_labels} etiquetas y {created} corridas activas."
+                for k in ("s2_control_pdfs", "s2_labels_txts"):
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.rerun()
+
+    st.subheader("Resumen de conciliación")
+    if open_manifests:
+        opts = {mf['lot_label']: int(mf['id']) for mf in open_manifests}
+        view_label = st.selectbox("Ver conciliación de lote", options=list(opts.keys()), key="s2_summary_lot_view")
+        view_mid = opts[view_label]
+        stats = _s2_get_stats(view_mid)
+        with st.expander("Ver detalle de conciliación", expanded=False):
+            st.write(
+                {
+                    "Lote": view_label,
+                    "Ventas con Pack ID": stats["ventas_with_pack"],
+                    "Packs distintos (Control)": stats["distinct_packs"],
+                    "Ventas con Envío (Control)": stats["ventas_with_ship"],
+                    "Etiquetas con Pack ID": stats["labels_with_pack"],
+                    "Etiquetas con Venta": stats["labels_with_sale"],
+                    "Ventas matcheadas por Pack": stats["matched_by_pack"],
+                    "Ventas sin Envío asignado": stats["missing_ship"],
+                }
+            )
+
+        st.subheader("Asignación Página → Mesa")
+        assigns = _s2_get_assignments(view_mid)
+        if assigns:
+            st.dataframe(
+                [{"Página": int(p), "Mesa": int(m)} for p, m in assigns],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Este lote todavía no tiene páginas asignadas.")
 
 
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Camarero")
     st.caption("Escaneo por etiqueta (Flex/Colecta) y productos por SKU/EAN")
-    mid = _s2_get_active_manifest_id()
-    st.session_state["sorting_manifest_id"] = mid
 
     mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
     st.session_state["s2_mesa_int"] = int(mesa)  # store separately; do not overwrite widget key
@@ -4982,6 +5756,18 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     # State: current sale
     if "s2_sale_open" not in st.session_state:
         st.session_state["s2_sale_open"] = None
+    if "s2_sale_open_manifest_id" not in st.session_state:
+        st.session_state["s2_sale_open_manifest_id"] = None
+
+    if st.session_state["s2_sale_open"] is not None and st.session_state.get("s2_sale_open_manifest_id"):
+        mid = int(st.session_state["s2_sale_open_manifest_id"])
+    else:
+        mid = _s2_find_manifest_by_mesa(int(mesa))
+        if not mid:
+            st.warning(f"La mesa {int(mesa)} no está asignada a ningún manifiesto abierto.")
+            return
+    st.session_state["sorting_manifest_id"] = mid
+    st.caption(f"Lote detectado para esta mesa: {_s2_lot_label(mid)}")
 
     if st.session_state["s2_sale_open"] is None:
         st.subheader("Escanea etiqueta (QR Flex o barra Colecta)")
@@ -5033,6 +5819,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                         sfx_emit("ERR")
                 else:
                     st.session_state["s2_sale_open"] = sale_id
+                    st.session_state["s2_sale_open_manifest_id"] = mid
                     st.session_state["s2_clear_label_scan"] = True
                     sfx_emit("OK")
                     st.rerun()
@@ -5235,6 +6022,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             if st.button("✅ Cerrar venta y volver a escanear etiqueta", key=f"s2_close_{sale_id}", use_container_width=True, disabled=not confirm_close):
                 _s2_close_sale(mid, sale_id)
                 st.session_state["s2_sale_open"] = None
+                st.session_state["s2_sale_open_manifest_id"] = None
                 st.session_state["s2_clear_prod_scan"] = True
                 st.session_state["s2_clear_label_scan"] = True
                 st.rerun()
@@ -5245,33 +6033,42 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
+    _s2_migrate_staged_to_active()
     st.title("Administrador")
 
     _render_module_backup_ui("sorting", "Sorting", SORTING_TABLES)
 
-    lots = _s2_get_open_manifests()
-    if not lots:
-        st.warning("No hay lotes abiertos en Sorting.")
+    work_manifests = _s2_list_open_manifests()
+    if not work_manifests:
+        st.info("No hay lotes activos en Sorting.")
+        if st.button("🧹 Reiniciar todo Sorting", key="s2_reset_no_lots"):
+            _s2_reset_all_sorting()
+            st.success("Sorting reiniciado.")
+            st.rerun()
         return
 
-    rows = []
-    for lot in lots:
-        s = lot.get("stats", {}) or {}
-        rows.append({
-            "Lote": f"Lote {lot['idx']}",
-            "Mesas": _s2_mesas_text(lot.get("mesas") or []),
-            "Ventas": int(s.get("ventas", 0) or 0),
-            "Items": int(s.get("items", 0) or 0),
-            "Etiquetas": int(s.get("etiquetas", 0) or 0),
-            "Avance ventas": f"{int(s.get('sales_done', 0) or 0)}/{int(s.get('sales_total', 0) or 0)}",
+    st.subheader("Lotes activos")
+    resumen = []
+    for mf in work_manifests:
+        progreso = f"{max(0, mf['sales_total'] - mf['sales_pending'])}/{mf['sales_total']}" if mf['sales_total'] else "0/0"
+        resumen.append({
+            "Lote": mf["lot_label"],
+            "Mesas": mf["mesas_text"],
+            "Ventas": mf["sales_total"],
+            "Pendientes": mf["sales_pending"],
+            "Avance": progreso,
+            "Control": mf["control_name"] or "-",
+            "Etiquetas": mf["labels_name"] or "-",
         })
-    st.subheader("Lotes abiertos")
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-    labels = {f"Lote {lot['idx']} · Mesas {_s2_mesas_text(lot.get('mesas') or [])}": lot['mid'] for lot in lots}
-    pick = st.selectbox("Ver lote", list(labels.keys()), key="s2_admin_lot_pick")
-    mid = labels[pick]
-    st.session_state["sorting_manifest_id"] = mid
+    options = {mf['lot_label']: int(mf['id']) for mf in work_manifests}
+    default_label = st.session_state.get("s2_admin_lot_label")
+    label_keys = list(options.keys())
+    if default_label not in label_keys:
+        default_label = label_keys[0]
+    selected_label = st.selectbox("Ver lote", options=label_keys, index=label_keys.index(default_label), key="s2_admin_lot_label")
+    mid = int(options[selected_label])
 
     conn = get_conn()
     c = conn.cursor()
@@ -5280,16 +6077,16 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
 
     st.subheader("Estado del lote")
     colA, colB, colC, colD = st.columns(4)
-    colA.metric("Mesas", _s2_mesas_text([int(x[0]) for x in c.execute("SELECT DISTINCT mesa FROM s2_sales WHERE manifest_id=? AND mesa IS NOT NULL ORDER BY mesa;", (mid,)).fetchall()]))
+    colA.metric("Lote", selected_label)
     colB.metric("Ventas (Control)", stats.get("ventas", 0))
     colC.metric("Items", stats.get("items", 0))
     colD.metric("Etiquetas", stats.get("etiquetas", 0))
 
     if f:
         control_name, labels_name, updated_at = f
-        st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
+        st.caption(f"Mesas: {_s2_mesas_text_from_list(next((mf['mesas'] for mf in work_manifests if int(mf['id']) == mid), []))} · Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
     else:
-        st.caption("Aún no se han cargado archivos para este lote.")
+        st.caption(f"Mesas: {_s2_mesas_text_from_list(next((mf['mesas'] for mf in work_manifests if int(mf['id']) == mid), []))}")
 
     st.divider()
     st.subheader("Trazabilidad")
@@ -5327,11 +6124,9 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
             ORDER BY s.mesa, s.page_no, s.row_no, s.sale_id, i.sku;""",
         (mid,),
     ).fetchall()
+
     if inc_rows:
-        df_inc = pd.DataFrame(
-            inc_rows,
-            columns=["Venta", "Mesa", "Envío", "SKU", "Descripción Control", "Solicitado", "Verificado", "Estado", "Modo", "Hora"],
-        )
+        df_inc = pd.DataFrame(inc_rows, columns=["Venta", "Mesa", "Envío", "SKU", "Descripción Control", "Solicitado", "Verificado", "Estado", "Modo", "Hora"])
         def _title_tec_for_sku(sku_val, fallback_desc=""):
             try:
                 if isinstance(inv_map_sku, dict):
@@ -5344,9 +6139,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
             return str(fallback_desc or sku_val or "")
         try:
             df_inc["Producto (técnico)"] = df_inc.apply(lambda r: _title_tec_for_sku(r["SKU"], r["Descripción Control"]), axis=1)
-        except Exception:
-            df_inc["Producto (técnico)"] = df_inc["SKU"].astype(str)
-        try:
             df_inc = df_inc[["Mesa", "Venta", "Envío", "SKU", "Producto (técnico)", "Solicitado", "Verificado", "Estado", "Modo", "Hora"]]
         except Exception:
             pass
@@ -5363,25 +6155,17 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     if pend:
         pend_data = []
         for sale_id, mesa, shipment_id, status in pend:
-            it = c.execute(
-                "SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) FROM s2_items WHERE manifest_id=? AND sale_id=?;",
-                (mid, sale_id),
-            ).fetchone()
+            it = c.execute("SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) FROM s2_items WHERE manifest_id=? AND sale_id=?;", (mid, sale_id)).fetchone()
             total = int(it[0] or 0)
             done = int(it[1] or 0)
-            pend_data.append({
-                "Venta": str(sale_id),
-                "Mesa": int(mesa or 0),
-                "Envío": str(shipment_id or ""),
-                "Estado": str(status),
-                "Items": f"{done}/{total}",
-            })
+            pend_data.append({"Venta": str(sale_id), "Mesa": int(mesa or 0), "Envío": str(shipment_id or ""), "Estado": str(status), "Items": f"{done}/{total}"})
         st.dataframe(pend_data, use_container_width=True, hide_index=True)
     else:
         st.success("No hay ventas pendientes: todo está cerrado.")
 
     with st.expander("Conciliación ventas ↔ etiquetas", expanded=False):
         st.write({
+            "Lote": selected_label,
             "Envíos únicos (labels)": stats.get("distinct_ship_labels"),
             "Ventas con Pack ID": stats.get("ventas_with_pack"),
             "Packs distintos (Control)": stats.get("distinct_packs"),
@@ -5398,279 +6182,51 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         and int(stats.get("sales_pending", 0) or 0) == 0
         and int(stats.get("items_pending", 0) or 0) == 0
     )
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("✅ Cerrar lote", disabled=not close_ok, use_container_width=True):
-            _s2_close_manifest(mid)
-            st.success(f"{_s2_lot_label(mid)} cerrado correctamente.")
-            st.rerun()
-        if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
-            st.info("Para cerrar el lote: todas las ventas deben estar cerradas y no deben quedar ítems pendientes.")
-    with c2:
-        if f"s2_delete_arm_{mid}" not in st.session_state:
-            st.session_state[f"s2_delete_arm_{mid}"] = False
-        arm = st.checkbox("Quiero eliminar este lote", key=f"s2_delete_arm_{mid}")
-        confirm_txt = st.text_input("Escribe BORRAR para confirmar", key=f"s2_delete_txt_{mid}", disabled=not arm)
-        if st.button("🗑️ Eliminar lote", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"), use_container_width=True):
-            lot_label = _s2_lot_label(mid)
-            _s2_delete_manifest(mid)
-            st.success(f"{lot_label} eliminado correctamente.")
-            st.rerun()
+    btn_close = st.button("✅ Cerrar lote", disabled=not close_ok)
+    if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
+        st.info("Este lote se podrá cerrar cuando todas las ventas estén cerradas y no queden ítems pendientes.")
+
+    if btn_close:
+        mesas_liberadas = sorted({int(r[1]) for r in _s2_get_assignments(mid)})
+        _s2_close_manifest(mid)
+        st.session_state["s2_upload_flash"] = f"{selected_label} cerrado. Mesas liberadas: {', '.join(map(str, mesas_liberadas)) if mesas_liberadas else '-'}"
+        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id", "s2_admin_lot_label"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
     st.divider()
+    st.subheader("Eliminar lote")
+    st.caption("Esto borra solo el lote seleccionado y libera sus mesas para reutilizarlas.")
+    if f"s2_delete_confirm_{mid}" not in st.session_state:
+        st.session_state[f"s2_delete_confirm_{mid}"] = False
+    arm_delete = st.checkbox("Quiero eliminar este lote", key=f"s2_delete_confirm_{mid}")
+    do_delete = st.button("🗑️ Eliminar lote seleccionado", disabled=not arm_delete)
+    if do_delete:
+        mesas_liberadas = sorted({int(r[1]) for r in _s2_get_assignments(mid)})
+        _s2_delete_manifest(mid)
+        st.session_state["s2_upload_flash"] = f"{selected_label} eliminado. Mesas liberadas: {', '.join(map(str, mesas_liberadas)) if mesas_liberadas else '-'}"
+        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id", "s2_admin_lot_label"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
+
     if "s2_reset_armed" not in st.session_state:
         st.session_state["s2_reset_armed"] = False
-    arm = st.checkbox("Quiero reiniciar Sorting completo (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
+
+    arm = st.checkbox("Quiero reiniciar Sorting (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
     st.session_state["s2_reset_armed"] = bool(arm)
-    confirm_txt = st.text_input("Escribe BORRAR TODO para confirmar", value="", disabled=not arm)
-    do_reset = st.button("🗑️ Reiniciar Sorting (borrar todo)", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR TODO"))
+
+    confirm_txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm)
+    do_reset = st.button("💥 Reiniciar Sorting completo", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"))
     if do_reset:
         _s2_reset_all_sorting()
-        for k in list(st.session_state.keys()):
-            if k.startswith("s2_") or "sorting" in k:
+        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id", "s2_admin_lot_label", "s2_upload_flash"]:
+            if k in st.session_state:
                 del st.session_state[k]
-        st.success("Sorting reiniciado completamente.")
+        st.success("Sorting reiniciado correctamente.")
         st.rerun()
 
-    conn.close()
-
-
-# =========================
-# CONTADOR DE PAQUETES (Flex/Colecta)
-# =========================
-def _pkg_norm_label(raw: str) -> str:
-    r = str(raw or "").strip()
-    d = only_digits(r)
-    return d if d else r
-
-def _pkg_get_open_run(kind: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id, created_at FROM pkg_counter_runs WHERE kind=? AND status='OPEN' ORDER BY id DESC LIMIT 1;",
-        (str(kind),),
-    )
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"id": int(row[0]), "created_at": row[1]}
-
-def _pkg_create_run(kind: str) -> int:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO pkg_counter_runs (kind, status, created_at) VALUES (?, 'OPEN', ?);",
-        (str(kind), now_iso()),
-    )
-    rid = int(c.lastrowid)
-    conn.commit()
-    conn.close()
-    return rid
-
-
-def _pkg_run_count(run_id: int) -> int:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(1) FROM pkg_counter_scans WHERE run_id=?;", (int(run_id),))
-    n = int(c.fetchone()[0] or 0)
-    conn.close()
-    return n
-
-def _pkg_last_scans(run_id: int, limit: int = 15):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT label_key, scanned_at FROM pkg_counter_scans WHERE run_id=? ORDER BY id DESC LIMIT ?;",
-        (int(run_id), int(limit)),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def _pkg_register_scan(run_id: int, label_key: str, raw: str):
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        c.execute(
-            "INSERT INTO pkg_counter_scans (run_id, label_key, raw, scanned_at) VALUES (?, ?, ?, ?);",
-            (int(run_id), str(label_key), str(raw or ""), now_iso()),
-        )
-        conn.commit()
-        return True, None
-    except Exception as e:
-        # SQLite lanza error por UNIQUE(run_id,label_key) => repetido
-        msg = str(e).lower()
-        if "unique" in msg or "constraint" in msg:
-            return False, "DUP"
-        return False, str(e)
-    finally:
-        conn.close()
-
-def _pkg_reset_kind(kind: str):
-    """Borra historial COMPLETO de ese tipo (Flex/Colecta): runs + scans."""
-    conn = get_conn()
-    c = conn.cursor()
-    # obtener runs
-    c.execute("SELECT id FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
-    rids = [int(r[0]) for r in c.fetchall()]
-    if rids:
-        qmarks = ",".join(["?"] * len(rids))
-        c.execute(f"DELETE FROM pkg_counter_scans WHERE run_id IN ({qmarks});", tuple(rids))
-    c.execute("DELETE FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
-    conn.commit()
-    conn.close()
-
-def page_pkg_counter():
-    st.header("🧮 Contador de paquetes")
-
-    # Selección manual (opción A): FLEX vs COLECTA
-    # - FLEX: el lector entrega JSON con hash_code
-    # - COLECTA: el lector entrega solo dígitos (shipment_id)
-    if "pkg_kind" not in st.session_state:
-        st.session_state["pkg_kind"] = "FLEX"
-
-    st.radio(
-        "Tipo",
-        options=["FLEX", "COLECTA"],
-        horizontal=True,
-        key="pkg_kind",
-    )
-
-    def _scan_detect_kind(raw: str) -> str:
-        s = str(raw or "").strip()
-        if s.startswith("{") and "\"hash_code\"" in s:
-            return "FLEX"
-        if re.fullmatch(r"\d+", s or ""):
-            return "COLECTA"
-        return "UNKNOWN"
-
-    def _scan_extract_label_key(raw: str, kind: str) -> str:
-        s = str(raw or "").strip()
-        if kind == "FLEX" and s.startswith("{"):
-            try:
-                import json
-                obj = json.loads(s)
-                val = obj.get("id", "")
-                return only_digits(val) or _pkg_norm_label(s)
-            except Exception:
-                return _pkg_norm_label(s)
-        # COLECTA: número puro
-        return only_digits(s) or _pkg_norm_label(s)
-
-    def ensure_run(kind: str) -> dict:
-        run = _pkg_get_open_run(kind)
-        if not run:
-            rid = _pkg_create_run(kind)
-            run = {"id": rid, "created_at": now_iso()}
-        return run
-
-    # Reinicio sin confirmación (debe ocurrir ANTES de crear el widget de input)
-    reset_kind = st.session_state.pop("pkg_reset_trigger_kind", None)
-    if reset_kind:
-        _pkg_reset_kind(str(reset_kind))
-        _ = _pkg_create_run(str(reset_kind))
-        try:
-            if "pkg_scan_input" in st.session_state:
-                del st.session_state["pkg_scan_input"]
-        except Exception:
-            pass
-        st.rerun()
-
-    def handle_scan(input_key: str):
-        raw = str(st.session_state.get(input_key, "") or "").strip()
-        if not raw:
-            return
-
-        selected_kind = str(st.session_state.get("pkg_kind") or "FLEX")
-        detected = _scan_detect_kind(raw)
-
-        if detected == "UNKNOWN":
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            sfx_emit("ERR")
-            st.session_state[input_key] = ""
-            return
-
-        if detected != selected_kind:
-            st.session_state["pkg_flash"] = ("err", f"Etiqueta {detected}. Estás en {selected_kind}.")
-            sfx_emit("ERR")
-            st.session_state[input_key] = ""
-            return
-
-        run = ensure_run(selected_kind)
-        run_id = int(run["id"])
-
-        label_key = _scan_extract_label_key(raw, selected_kind)
-        if not label_key:
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            st.session_state[input_key] = ""
-            return
-
-        ok, err = _pkg_register_scan(run_id, label_key, raw)
-        if ok:
-            st.session_state["pkg_flash"] = ("ok", "OK")
-            sfx_emit("OK")
-        else:
-            if err == "DUP":
-                st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
-                sfx_emit("ERR")
-            else:
-                st.session_state["pkg_flash"] = ("err", "Error al registrar")
-                sfx_emit("ERR")
-
-        # dejar el campo en blanco para el siguiente escaneo
-        st.session_state[input_key] = ""
-
-    # asegura corrida activa del tipo seleccionado
-    KIND = str(st.session_state.get("pkg_kind") or "FLEX")
-    run = ensure_run(KIND)
-    run_id = int(run["id"])
-
-    # aviso minimalista (una vez)
-    if "pkg_flash" in st.session_state:
-        k, msg = st.session_state.get("pkg_flash", ("info", ""))
-        if msg:
-            if k == "ok":
-                st.success(msg)
-            elif k == "dup":
-                st.warning(msg)
-            else:
-                st.error(msg)
-        st.session_state.pop("pkg_flash", None)
-
-    total = _pkg_run_count(run_id)
-    st.metric("Paquetes contabilizados", total)
-
-    # Escaneo automático (sin botones)
-    input_key = "pkg_scan_input"
-    st.text_input(
-        "Escaneo (lector)",
-        key=input_key,
-        on_change=handle_scan,
-        args=(input_key,),
-    )
-    force_tel_keyboard("Escaneo (lector)")
-    autofocus_input("Escaneo (lector)")
-
-    # Últimos escaneos
-    rows = _pkg_last_scans(run_id, 15)
-    if rows:
-        df_last = pd.DataFrame(rows, columns=["Etiqueta", "Hora"])
-        df_last["Hora"] = df_last["Hora"].apply(to_chile_display)
-        st.dataframe(df_last, use_container_width=True, hide_index=True)
-    else:
-        st.info("Aún no hay paquetes en esta corrida.")
-
-    # Única acción
-    if st.button("🔄 Reiniciar corrida", use_container_width=True, key="pkg_reset_now"):
-        st.session_state["pkg_reset_trigger_kind"] = KIND
-        st.rerun()
-
-
-
-# =========================
-# PACKING (Embalador) + DESPACHO (flujo desde Sorting v2)
-# =========================
 
 def _s2_pack_dispatch_create_tables():
     """Tablas auxiliares para Embalador y Despacho (no toca lógica Sorting)."""
