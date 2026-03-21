@@ -5118,6 +5118,16 @@ def _s2_auto_assign_specific_pages(mid: int, pages: list[int], start_mesa: int =
     return len(set(pages))
 
 
+def _s2_build_assignment_preview(pages: list[int], start_mesa: int = 1, mesas_count: int = 3):
+    pages = sorted({int(p) for p in (pages or [])})
+    mesas_count = max(1, int(mesas_count or 1))
+    start_mesa = max(1, int(start_mesa or 1))
+    preview = []
+    for i, p in enumerate(pages):
+        preview.append({"Página": int(p), "Mesa": int(start_mesa + (i % mesas_count))})
+    return preview
+
+
 def _s2_append_labels(mid: int, labels_name: str, labels_bytes: bytes):
     pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
     try:
@@ -5394,14 +5404,29 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         if pdf is not None or zpl is not None:
             prev_count = len({m for _, m in assigns_now}) if assigns_now else 0
             next_start_preview, mesa_block_preview = _s2_next_mesa_block(mid, default_count=max(1, prev_count or 3))
+            if not has_existing_pages:
+                next_start_preview, mesa_block_preview = 1, 3
             with st.container(border=True):
                 st.markdown("**Resumen de la carga lista para confirmar**")
                 st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
                 st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
                 if has_existing_pages:
-                    st.caption(f"Esta carga se agregará al manifiesto actual y las páginas nuevas partirán desde mesa **{next_start_preview}**.")
+                    st.caption(f"Esta carga se agregará al manifiesto actual y las páginas nuevas partirán desde mesa **{next_start_preview}** usando **{mesa_block_preview}** mesa(s).")
                 else:
                     st.caption("Esta será la carga inicial del manifiesto activo.")
+                    st.caption("La distribución inicial se preparará en un bloque de **3 mesas**: 1, 2 y 3.")
+                if pdf is not None:
+                    try:
+                        parsed_preview = _s2_parse_control_pdf(pdf.getvalue())
+                        preview_pages = sorted({int(r.get("page_no") or 1) for r in parsed_preview})
+                    except Exception:
+                        preview_pages = []
+                    if preview_pages:
+                        st.write(f"**Páginas detectadas en el Control:** {len(preview_pages)}")
+                        preview_rows = _s2_build_assignment_preview(preview_pages, start_mesa=next_start_preview, mesas_count=mesa_block_preview)
+                        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No pude previsualizar las páginas del Control antes de confirmar, pero la carga igual se podrá procesar.")
 
         process_one = st.button(
             "Confirmar carga de Control + Etiquetas",
@@ -5453,7 +5478,7 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                     conn.commit()
                     conn.close()
                     n_sales = _s2_upsert_control(mid, pdf_name, pdf_bytes)
-                    _s2_auto_assign_pages(mid, num_mesas=10)
+                    _s2_auto_assign_specific_pages(mid, _s2_get_pages(mid), start_mesa=1, mesas_count=3)
                     n_labels = _s2_upsert_labels(mid, zpl_name, zpl_bytes)
                     st.session_state["s2_upload_flash"] = f"Carga inicial confirmada: {n_sales} ventas y {n_labels} etiquetas cargadas."
 
@@ -5557,6 +5582,9 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
 
     st.subheader("Asignación Página → Mesa")
     assigns = dict(_s2_get_assignments(mid))
+    preview_actual = [{"Página": int(p), "Mesa": int(assigns.get(p, 1))} for p in pages]
+    if preview_actual:
+        st.dataframe(preview_actual, use_container_width=True, hide_index=True)
     for p in pages:
         cur = assigns.get(p, 1)
         new_mesa = st.number_input(f"Página {p} → Mesa", min_value=1, max_value=50, value=int(cur), key=f"s2_mesa_{p}")
