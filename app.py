@@ -2360,9 +2360,22 @@ def page_app_lobby():
 def page_import(inv_map_sku: dict, familia_map_sku: dict):
     st.header("Importar ventas")
 
-    if st.session_state.get("picking_import_flash"):
-        st.success(st.session_state.get("picking_import_flash"))
-        st.session_state["picking_import_flash"] = ""
+    flash = st.session_state.get("picking_import_flash")
+    if flash:
+        if isinstance(flash, dict):
+            level = str(flash.get("level") or "success").lower().strip()
+            msg = str(flash.get("message") or "").strip()
+        else:
+            level = "success"
+            msg = str(flash).strip()
+        if msg:
+            if level == "warning":
+                st.warning(msg)
+            elif level == "error":
+                st.error(msg)
+            else:
+                st.success(msg)
+        st.session_state.pop("picking_import_flash", None)
 
     batches = _get_picking_batches_summary()
     if batches:
@@ -2424,15 +2437,32 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
             )
             if not result.get("created"):
                 if result.get("reason") == "duplicate":
-                    st.warning("No se agregó una nueva tanda porque todas las ventas de este archivo ya estaban cargadas en la corrida actual.")
+                    st.session_state["picking_import_flash"] = {
+                        "level": "warning",
+                        "message": "No se agregó una nueva tanda porque todas las ventas de este archivo ya estaban cargadas en la corrida actual.",
+                    }
+                    st.rerun()
                 else:
-                    st.warning("No se pudo crear una nueva tanda con este archivo.")
+                    st.session_state["picking_import_flash"] = {
+                        "level": "warning",
+                        "message": "No se pudo crear una nueva tanda con este archivo.",
+                    }
+                    st.rerun()
             else:
-                st.session_state["picking_import_flash"] = f"Nueva tanda creada: {', '.join(result.get('picker_names', []))}. Ya puedes ir a Picking."
+                picker_names = [str(x).strip() for x in (result.get('picker_names') or []) if str(x).strip()]
+                ots_created = int(result.get('ots_created') or len(picker_names) or 0)
+                pickers_txt = ", ".join(picker_names) if picker_names else f"{ots_created} OT{'s' if ots_created != 1 else ''}"
+                st.session_state["picking_import_flash"] = {
+                    "level": "success",
+                    "message": f"Nueva carga creada correctamente: {pickers_txt}. Ya puedes ir a Picking.",
+                }
                 st.rerun()
         else:
             save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
-            st.session_state["picking_import_flash"] = "OTs creadas. Anda a Picking y selecciona P1, P2, ..."
+            st.session_state["picking_import_flash"] = {
+                "level": "success",
+                "message": "OTs creadas. Anda a Picking y selecciona P1, P2, ...",
+            }
             st.rerun()
 
 
