@@ -5535,12 +5535,8 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 st.success(f"Etiquetas procesadas en lote. IDs detectados: {total_labels}")
 
     stats = _s2_get_stats(mid)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Ventas (Control)", stats["ventas"])
-    c2.metric("Items (líneas)", stats["items"])
-    c3.metric("Etiquetas (total)", stats["etiquetas"])
-    c4.metric("Envíos únicos (labels)", stats["distinct_ship_labels"])
 
+    st.subheader("Resumen de conciliación")
     with st.expander("Ver detalle de conciliación", expanded=False):
         st.write(
             {
@@ -5556,7 +5552,7 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
 
     pages = _s2_get_pages(mid)
     if not pages:
-        st.info("Sube el Control.pdf para continuar.")
+        st.info("Sube Control + Etiquetas y confirma la carga para continuar.")
         return
 
     st.subheader("Asignación Página → Mesa")
