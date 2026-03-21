@@ -5740,14 +5740,19 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
             _s2_auto_assign_specific_pages(mid, missing, start_mesa=start_mesa, mesas_count=mesa_block)
             st.rerun()
 
+    _s2_created_flash = st.session_state.pop("s2_created_flash", None)
+    if _s2_created_flash:
+        st.success(_s2_created_flash)
+
     st.divider()
     if st.button("✅ Crear corridas", use_container_width=True):
         created = _s2_create_corridas(mid)
         if created <= 0:
             st.error("No se crearon corridas. Revisa asignación de páginas.")
         else:
-            st.success(f"Corridas creadas/actualizadas: {created}")
             st.session_state["s2_last_created"] = created
+            st.session_state["s2_created_flash"] = f"Corridas creadas/actualizadas correctamente: {created}"
+            st.rerun()
 
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
