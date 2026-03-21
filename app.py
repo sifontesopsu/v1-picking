@@ -2360,6 +2360,10 @@ def page_app_lobby():
 def page_import(inv_map_sku: dict, familia_map_sku: dict):
     st.header("Importar ventas")
 
+    if st.session_state.get("picking_import_flash"):
+        st.success(st.session_state.get("picking_import_flash"))
+        st.session_state["picking_import_flash"] = ""
+
     batches = _get_picking_batches_summary()
     if batches:
         st.subheader("Tandas de picking activas")
@@ -2424,11 +2428,11 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
                 else:
                     st.warning("No se pudo crear una nueva tanda con este archivo.")
             else:
-                st.success(f"Nueva tanda creada: {', '.join(result.get('picker_names', []))}. Ya puedes ir a Picking.")
+                st.session_state["picking_import_flash"] = f"Nueva tanda creada: {', '.join(result.get('picker_names', []))}. Ya puedes ir a Picking."
                 st.rerun()
         else:
             save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
-            st.success("OTs creadas. Anda a Picking y selecciona P1, P2, ...")
+            st.session_state["picking_import_flash"] = "OTs creadas. Anda a Picking y selecciona P1, P2, ..."
             st.rerun()
 
 
@@ -5375,58 +5379,88 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     )
 
     if mode.startswith("Uno"):
+        if st.session_state.get("s2_upload_flash"):
+            st.success(st.session_state.get("s2_upload_flash"))
+            st.session_state["s2_upload_flash"] = ""
+
         col1, col2 = st.columns(2)
         with col1:
             pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf")
         with col2:
             zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
 
-        if pdf is not None:
-            pdf_name = getattr(pdf, "name", "control.pdf")
-            pdf_bytes = pdf.getvalue()
-            if has_existing_pages:
-                page_offset = _s2_get_max_page(mid)
-                prev_pages = set(_s2_get_pages(mid))
-                next_start, mesa_block = _s2_next_mesa_block(mid, default_count=max(1, len({m for _, m in assigns_now}) or 3))
-                n_sales = _s2_append_control(mid, pdf_name, pdf_bytes, page_offset=page_offset)
-                new_pages = [p for p in _s2_get_pages(mid) if p not in prev_pages]
-                _s2_auto_assign_specific_pages(mid, new_pages, start_mesa=next_start, mesas_count=mesa_block)
-                try:
+        st.caption("La carga no se procesa automáticamente. Primero sube los archivos y luego confirma con el botón.")
+
+        if pdf is not None or zpl is not None:
+            prev_count = len({m for _, m in assigns_now}) if assigns_now else 0
+            next_start_preview, mesa_block_preview = _s2_next_mesa_block(mid, default_count=max(1, prev_count or 3))
+            with st.container(border=True):
+                st.markdown("**Resumen de la carga lista para confirmar**")
+                st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
+                st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
+                if has_existing_pages:
+                    st.caption(f"Esta carga se agregará al manifiesto actual y las páginas nuevas partirán desde mesa **{next_start_preview}**.")
+                else:
+                    st.caption("Esta será la carga inicial del manifiesto activo.")
+
+        process_one = st.button(
+            "Confirmar carga de Control + Etiquetas",
+            type="primary",
+            disabled=(pdf is None and zpl is None),
+            key="s2_process_single_upload",
+        )
+
+        if process_one:
+            if pdf is None:
+                st.error("Debes subir el Control (PDF) antes de confirmar la carga.")
+            elif zpl is None:
+                st.error("Debes subir también las Etiquetas (TXT/ZPL) antes de confirmar la carga.")
+            else:
+                pdf_name = getattr(pdf, "name", "control.pdf")
+                pdf_bytes = pdf.getvalue()
+                zpl_name = getattr(zpl, "name", "etiquetas.txt")
+                zpl_bytes = zpl.getvalue()
+
+                if has_existing_pages:
+                    page_offset = _s2_get_max_page(mid)
+                    prev_pages = set(_s2_get_pages(mid))
+                    next_start, mesa_block = _s2_next_mesa_block(mid, default_count=max(1, len({m for _, m in assigns_now}) or 3))
+                    n_sales = _s2_append_control(mid, pdf_name, pdf_bytes, page_offset=page_offset)
+                    new_pages = [p for p in _s2_get_pages(mid) if p not in prev_pages]
+                    _s2_auto_assign_specific_pages(mid, new_pages, start_mesa=next_start, mesas_count=mesa_block)
+                    try:
+                        conn = get_conn()
+                        c = conn.cursor()
+                        prev = c.execute("SELECT control_name FROM s2_files WHERE manifest_id=?;", (mid,)).fetchone()
+                        prev_name = str(prev[0] or "").strip() if prev else ""
+                        merged = pdf_name if not prev_name else f"{prev_name} + {pdf_name}"
+                        c.execute("""INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
+                                     VALUES(?, ?, ?, ?)
+                                     ON CONFLICT(manifest_id) DO UPDATE SET
+                                        control_name=excluded.control_name,
+                                        updated_at=excluded.updated_at;""", (mid, pdf_bytes, merged, _s2_now_iso()))
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
+                    n_labels = _s2_append_labels(mid, zpl_name, zpl_bytes)
+                    st.session_state["s2_upload_flash"] = f"Carga agregada: {n_sales} ventas nuevas y {n_labels} etiquetas. Páginas nuevas asignadas desde mesa {next_start}."
+                else:
                     conn = get_conn()
                     c = conn.cursor()
-                    prev = c.execute("SELECT control_name FROM s2_files WHERE manifest_id=?;", (mid,)).fetchone()
-                    prev_name = str(prev[0] or "").strip() if prev else ""
-                    merged = pdf_name if not prev_name else f"{prev_name} + {pdf_name}"
-                    c.execute("""INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
-                                 VALUES(?, ?, ?, ?)
-                                 ON CONFLICT(manifest_id) DO UPDATE SET
-                                    control_name=excluded.control_name,
-                                    updated_at=excluded.updated_at;""", (mid, pdf_bytes, merged, _s2_now_iso()))
+                    c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
+                    c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
                     conn.commit()
                     conn.close()
-                except Exception:
-                    pass
-                st.success(f"Control agregado. Ventas detectadas: {n_sales}. Páginas nuevas asignadas desde mesa {next_start}.")
-            else:
-                conn = get_conn()
-                c = conn.cursor()
-                c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
-                c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
-                conn.commit()
-                conn.close()
-                n_sales = _s2_upsert_control(mid, pdf_name, pdf_bytes)
-                st.success(f"Control cargado. Ventas detectadas: {n_sales}")
-                _s2_auto_assign_pages(mid, num_mesas=10)
+                    n_sales = _s2_upsert_control(mid, pdf_name, pdf_bytes)
+                    _s2_auto_assign_pages(mid, num_mesas=10)
+                    n_labels = _s2_upsert_labels(mid, zpl_name, zpl_bytes)
+                    st.session_state["s2_upload_flash"] = f"Carga inicial confirmada: {n_sales} ventas y {n_labels} etiquetas cargadas."
 
-        if zpl is not None:
-            zpl_name = getattr(zpl, "name", "etiquetas.txt")
-            zpl_bytes = zpl.getvalue()
-            if stats["etiquetas"] > 0:
-                n_labels = _s2_append_labels(mid, zpl_name, zpl_bytes)
-                st.success(f"Etiquetas agregadas. IDs detectados: {n_labels}")
-            else:
-                n_labels = _s2_upsert_labels(mid, zpl_name, zpl_bytes)
-                st.success(f"Etiquetas cargadas. IDs detectados: {n_labels}")
+                for k in ("s2_control_pdf", "s2_labels_txt"):
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.rerun()
 
     else:
         st.info("📦 Lote: se suman las páginas de todos los Controles sin borrar la carga anterior. Cada lote nuevo se manda a mesas nuevas automáticamente.")
