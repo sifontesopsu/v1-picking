@@ -17,6 +17,7 @@ from contextlib import contextmanager
 DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
+S2_DEFAULT_BLOCK_MESAS = 3
 
 
 # =========================
@@ -951,8 +952,6 @@ def init_db():
     _ensure_col("picking_tasks", "defer_at", "TEXT")
     _ensure_col("picking_tasks", "family", "TEXT")
     _ensure_col("picking_ots", "model", "TEXT")
-    _ensure_col("picking_ots", "batch_key", "TEXT")
-    _ensure_col("picking_ots", "batch_label", "TEXT")
     _ensure_col("picking_incidences", "note", "TEXT")
 
 
@@ -1736,82 +1735,6 @@ def import_sales_excel(file) -> pd.DataFrame:
 
     out = pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
     return out
-def _next_picker_numbers(existing_names: list[str], qty: int) -> list[int]:
-    nums = []
-    for pname in existing_names or []:
-        m = re.fullmatch(r"P(\d+)", str(pname or "").strip().upper())
-        if m:
-            nums.append(int(m.group(1)))
-    start_n = (max(nums) + 1) if nums else 1
-    return list(range(start_n, start_n + int(qty)))
-
-
-def _get_current_picker_names() -> list[str]:
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        c.execute("SELECT name FROM pickers ORDER BY id")
-        rows = [str(r[0]) for r in c.fetchall()]
-    except Exception:
-        rows = []
-    conn.close()
-    return rows
-
-
-def _build_picking_batch_label(source_label: str | None, model: str, picker_names: list[str]) -> str:
-    src = str(source_label or "Manifiesto").strip() or "Manifiesto"
-    picks = ", ".join(picker_names) if picker_names else "Sin pickeadores"
-    model_txt = "Por ventas" if str(model or "VENTAS").upper().strip() == "VENTAS" else "Por SKU"
-    return f"{src} · {model_txt} · {picks}"
-
-
-def _get_picking_batches_summary() -> list[dict]:
-    conn = get_conn()
-    c = conn.cursor()
-    rows = []
-    try:
-        c.execute("""
-            SELECT
-                COALESCE(po.batch_key, po.ot_code, 'SIN_LOTE') AS batch_key,
-                COALESCE(MAX(NULLIF(po.batch_label,'')), MAX(po.ot_code), 'Lote') AS batch_label,
-                MIN(po.created_at) AS created_at,
-                GROUP_CONCAT(DISTINCT pk.name) AS pickers,
-                COUNT(DISTINCT po.id) AS ots,
-                COUNT(DISTINCT oo.order_id) AS orders_count,
-                SUM(CASE WHEN pt.status='PENDING' THEN 1 ELSE 0 END) AS pending_tasks,
-                SUM(CASE WHEN pt.status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) AS done_tasks,
-                COUNT(DISTINCT CASE WHEN po.status='OPEN' THEN po.id END) AS open_ots
-            FROM picking_ots po
-            JOIN pickers pk ON pk.id = po.picker_id
-            LEFT JOIN ot_orders oo ON oo.ot_id = po.id
-            LEFT JOIN picking_tasks pt ON pt.ot_id = po.id
-            GROUP BY COALESCE(po.batch_key, po.ot_code, 'SIN_LOTE')
-            ORDER BY MIN(po.created_at) DESC, batch_key DESC
-        """)
-        for batch_key, batch_label, created_at, pickers, ots, orders_count, pending_tasks, done_tasks, open_ots in c.fetchall():
-            pending_tasks = int(pending_tasks or 0)
-            done_tasks = int(done_tasks or 0)
-            total_tasks = pending_tasks + done_tasks
-            pct = 0.0 if total_tasks == 0 else round((done_tasks * 100.0) / total_tasks, 1)
-            rows.append({
-                "batch_key": str(batch_key),
-                "batch_label": str(batch_label or "Lote"),
-                "created_at": created_at,
-                "pickers": str(pickers or ""),
-                "ots": int(ots or 0),
-                "orders_count": int(orders_count or 0),
-                "pending_tasks": pending_tasks,
-                "done_tasks": done_tasks,
-                "total_tasks": total_tasks,
-                "open_ots": int(open_ots or 0),
-                "progress_pct": pct,
-            })
-    except Exception:
-        rows = []
-    conn.close()
-    return rows
-
-
 def save_orders_and_build_ots(
     sales_df: pd.DataFrame,
     inv_map_sku: dict,
@@ -2051,232 +1974,6 @@ def save_orders_and_build_ots(
     conn.close()
 
 
-def append_orders_and_build_ots(
-    sales_df: pd.DataFrame,
-    inv_map_sku: dict,
-    num_pickers: int,
-    model: str = "VENTAS",
-    familia_map_sku: dict | None = None,
-    source_label: str | None = None,
-):
-    """Agrega una nueva carga de picking sin borrar la tanda actual."""
-    model = (model or "VENTAS").upper().strip()
-    if model not in ("VENTAS", "SKU"):
-        model = "VENTAS"
-
-    familia_map_sku = familia_map_sku or {}
-    sales_df = sales_df.copy()
-    if sales_df.empty:
-        return {"created": False, "reason": "empty", "new_orders": 0, "picker_names": []}
-
-    sales_df["ml_order_id"] = sales_df["ml_order_id"].astype(str).str.strip()
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    try:
-        c.execute("""
-            SELECT DISTINCT TRIM(o.ml_order_id)
-            FROM ot_orders oo
-            JOIN orders o ON o.id = oo.order_id
-        """)
-        existing_loaded = {str(r[0]).strip() for r in c.fetchall() if str(r[0]).strip()}
-    except Exception:
-        existing_loaded = set()
-
-    new_order_ids = [oid for oid in sales_df["ml_order_id"].drop_duplicates().tolist() if str(oid).strip() and str(oid).strip() not in existing_loaded]
-    if not new_order_ids:
-        conn.close()
-        return {"created": False, "reason": "duplicate", "new_orders": 0, "picker_names": []}
-
-    sales_df = sales_df[sales_df["ml_order_id"].isin(new_order_ids)].copy()
-
-    existing_picker_names = _get_current_picker_names()
-    picker_numbers = _next_picker_numbers(existing_picker_names, int(num_pickers))
-    picker_names = [f"P{n}" for n in picker_numbers]
-    batch_key = f"PK-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))}"
-    batch_label = _build_picking_batch_label(source_label, model, picker_names)
-
-    cortes_set = load_cortes_set()
-    order_id_by_ml = {}
-    for ml_order_id, g in sales_df.groupby("ml_order_id"):
-        ml_order_id = str(ml_order_id).strip()
-        buyer = str(g["buyer"].iloc[0]) if "buyer" in g.columns else ""
-        created = now_iso()
-
-        c.execute("SELECT id FROM orders WHERE ml_order_id = ?", (ml_order_id,))
-        row = c.fetchone()
-        if row:
-            order_id = row[0]
-            c.execute("UPDATE orders SET buyer=?, created_at=? WHERE id=?", (buyer, created, order_id))
-            c.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
-        else:
-            c.execute("INSERT INTO orders (ml_order_id, buyer, created_at) VALUES (?,?,?)", (ml_order_id, buyer, created))
-            order_id = c.lastrowid
-
-        order_id_by_ml[ml_order_id] = order_id
-
-        for _, r in g.iterrows():
-            sku = normalize_sku(r["sku_ml"])
-            qty = int(r["qty"])
-            title_ml = str(r.get("title_ml", "") or "").strip()
-            title_tec = inv_map_sku.get(sku, "")
-            title_eff = title_tec if title_tec else title_ml
-            c.execute(
-                "INSERT INTO order_items (order_id, sku_ml, title_ml, title_tec, qty) VALUES (?,?,?,?,?)",
-                (order_id, sku, title_eff, title_tec, qty)
-            )
-
-    picker_ids = []
-    for name in picker_names:
-        c.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (name,))
-        c.execute("SELECT id FROM pickers WHERE name=?", (name,))
-        row = c.fetchone()
-        if row:
-            picker_ids.append(int(row[0]))
-
-    ot_ids = []
-    for pid in picker_ids:
-        c.execute(
-            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at, model, batch_key, batch_label) VALUES (?,?,?,?,?,?,?,?)",
-            ("", pid, "OPEN", now_iso(), None, model, batch_key, batch_label)
-        )
-        ot_id = c.lastrowid
-        ot_code = f"OT{ot_id:06d}"
-        c.execute("UPDATE picking_ots SET ot_code=? WHERE id=?", (ot_code, ot_id))
-        ot_ids.append(ot_id)
-
-    unique_orders = sales_df[["ml_order_id"]].drop_duplicates().reset_index(drop=True)
-    assignments = {}
-    for idx, row in unique_orders.iterrows():
-        ot_id = ot_ids[idx % len(ot_ids)]
-        assignments[str(row["ml_order_id"]).strip()] = ot_id
-
-    for ml_order_id, ot_id in assignments.items():
-        order_id = order_id_by_ml[ml_order_id]
-        c.execute("INSERT INTO ot_orders (ot_id, order_id) VALUES (?,?)", (ot_id, order_id))
-
-    if model == "VENTAS":
-        for ot_id in ot_ids:
-            c.execute("""
-                SELECT oi.sku_ml,
-                       COALESCE(NULLIF(oi.title_tec,''), oi.title_ml) AS title,
-                       MAX(COALESCE(oi.title_tec,'')) AS title_tec_any,
-                       SUM(oi.qty) as total
-                FROM ot_orders oo
-                JOIN order_items oi ON oi.order_id = oo.order_id
-                WHERE oo.ot_id = ?
-                GROUP BY oi.sku_ml, title
-                ORDER BY CAST(oi.sku_ml AS INTEGER), oi.sku_ml
-            """, (ot_id,))
-            rows = c.fetchall()
-            for sku, title, title_tec_any, total in rows:
-                if sku in cortes_set:
-                    c.execute(
-                        "INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, created_at) VALUES (?,?,?,?,?,?)",
-                        (ot_id, sku, title, title_tec_any, int(total), now_iso())
-                    )
-                else:
-                    c.execute("""
-                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode, family)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                    """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None, None))
-
-        conn.commit()
-        conn.close()
-        return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_label": batch_label}
-
-    dfw = sales_df.copy()
-    dfw["sku_ml"] = dfw["sku_ml"].map(normalize_sku)
-    dfw = dfw[dfw["sku_ml"].ne("")].copy()
-
-    title_ml_by_sku = {}
-    if "title_ml" in dfw.columns:
-        for sku, g in dfw.groupby("sku_ml"):
-            t = ""
-            for v in g["title_ml"].tolist():
-                v = str(v or "").strip()
-                if v and v.lower() != "nan":
-                    t = v
-                    break
-            title_ml_by_sku[sku] = t
-
-    _fam_prefix6 = {}
-    try:
-        fam_counts = {}
-        for k, v in (familia_map_sku or {}).items():
-            base_sku = normalize_sku(k)
-            fam = str(v or "").strip()
-            if not base_sku or len(base_sku) < 6 or not fam or fam.lower() == "nan":
-                continue
-            pref6 = base_sku[:6]
-            fam_counts.setdefault(pref6, {})
-            fam_counts[pref6][fam] = fam_counts[pref6].get(fam, 0) + 1
-        for pref6, fam_map in fam_counts.items():
-            _fam_prefix6[pref6] = sorted(fam_map.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-    except Exception:
-        _fam_prefix6 = {}
-
-    def _fam_for_sku(sku: str) -> str:
-        f = str(familia_map_sku.get(sku, "") or "").strip()
-        if f and f.lower() != "nan":
-            return f
-        ssku = normalize_sku(sku)
-        if not ssku:
-            return "Sin Familia"
-        fam6 = _fam_prefix6.get(ssku[:6], "")
-        if fam6:
-            return fam6
-        return "Sin Familia"
-
-    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
-    grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
-    grp["qty"] = grp["qty"].astype(int)
-
-    fam_weights = grp.groupby("family")["qty"].sum().to_dict()
-    fam_list = sorted(fam_weights.items(), key=lambda x: x[1], reverse=True)
-    ot_load = {ot_id: 0 for ot_id in ot_ids}
-    ot_fams = {ot_id: [] for ot_id in ot_ids}
-    for fam, w in fam_list:
-        target_ot = min(ot_load.items(), key=lambda kv: kv[1])[0]
-        ot_fams[target_ot].append(fam)
-        ot_load[target_ot] += int(w or 0)
-
-    for ot_id in ot_ids:
-        fams = ot_fams.get(ot_id, [])
-        if not fams:
-            continue
-        sub = grp[grp["family"].isin(fams)].copy()
-        try:
-            sub["sku_int"] = sub["sku_ml"].map(lambda x: int(x) if str(x).isdigit() else 10**18)
-            sub = sub.sort_values(["family", "sku_int", "sku_ml"], ascending=[True, True, True])
-        except Exception:
-            sub = sub.sort_values(["family", "sku_ml"], ascending=[True, True])
-
-        for _, r in sub.iterrows():
-            fam = str(r["family"])
-            sku = str(r["sku_ml"])
-            total = int(r["qty"] or 0)
-            title_tec = inv_map_sku.get(sku, "") or ""
-            title_ml = title_ml_by_sku.get(sku, "") or ""
-            title_eff = title_tec.strip() if title_tec.strip() else title_ml.strip()
-            if sku in cortes_set:
-                c.execute(
-                    "INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, created_at) VALUES (?,?,?,?,?,?)",
-                    (ot_id, sku, title_eff, title_tec, total, now_iso())
-                )
-            else:
-                c.execute("""
-                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode, family)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (ot_id, sku, title_eff, title_tec, total, 0, "PENDING", None, None, fam))
-
-    conn.commit()
-    conn.close()
-    return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_label": batch_label}
-
-
-
 # =========================
 # UI: LOBBY APP (MODO)
 # =========================
@@ -2359,81 +2056,46 @@ def page_app_lobby():
     st.caption("Escanea etiquetas y cuenta paquetes; evita duplicados.")
 def page_import(inv_map_sku: dict, familia_map_sku: dict):
     st.header("Importar ventas")
+    # Bloqueo duro: no permitir cargar otra tanda si hay una en curso
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(1) FROM picking_ots WHERE status='OPEN'")
+        open_ots = int(c.fetchone()[0] or 0)
+        c.execute("SELECT COUNT(1) FROM picking_tasks WHERE status='PENDING'")
+        pending_tasks = int(c.fetchone()[0] or 0)
+    except Exception:
+        open_ots, pending_tasks = 0, 0
+    conn.close()
 
-    if st.session_state.get("picking_import_flash"):
-        st.success(st.session_state.get("picking_import_flash"))
-        st.session_state["picking_import_flash"] = ""
-
-    batches = _get_picking_batches_summary()
-    if batches:
-        st.subheader("Tandas de picking activas")
-        cols = st.columns(min(3, len(batches)))
-        for i, batch in enumerate(batches):
-            with cols[i % len(cols)]:
-                with st.container(border=True):
-                    st.markdown(f"**{batch['batch_label']}**")
-                    st.caption(f"Creada: {to_chile_display(batch['created_at'])}")
-                    total = int(batch.get('total_tasks', 0) or 0)
-                    done = int(batch.get('done_tasks', 0) or 0)
-                    pct = float(batch.get('progress_pct', 0.0) or 0.0)
-                    st.progress(min(max(pct / 100.0, 0.0), 1.0))
-                    st.caption(f"{done}/{total} tareas resueltas · {pct:.1f}%")
-                    st.write(f"**Pickeadores:** {batch.get('pickers') or '-'}")
-                    a, b = st.columns(2)
-                    a.metric("Ventas", int(batch.get('orders_count', 0) or 0))
-                    b.metric("OTs abiertas", int(batch.get('open_ots', 0) or 0))
-        st.divider()
+    if open_ots > 0 or pending_tasks > 0:
+        st.warning("⚠️ Ya hay una tanda de Picking en curso. Para cargar otra, ve a **Administrador** y reinicia/borra la tanda actual.")
+        return
 
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
-    num_pickers = st.number_input("Cantidad de pickeadores nuevos para esta carga", min_value=1, max_value=20, value=3 if batches else 5, step=1)
+    num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
     model_pick = st.radio("Elegir modelo", ["Por ventas", "Por sku"], horizontal=True)
 
-    next_names = [f"P{n}" for n in _next_picker_numbers(_get_current_picker_names(), int(num_pickers))]
-    st.info(f"Esta carga creará: **{', '.join(next_names)}**")
-
-    source_label = ""
     if origen == "Excel Mercado Libre":
         file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
         if not file:
             st.info("Sube el Excel de ventas.")
             return
-        source_label = getattr(file, "name", "Excel ML")
         sales_df = import_sales_excel(file)
     else:
         pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ml_pdf")
         if not pdf_file:
             st.info("Sube el PDF.")
             return
-        source_label = getattr(pdf_file, "name", "Manifiesto PDF")
         sales_df = parse_manifest_pdf(pdf_file)
 
     st.subheader("Vista previa")
     st.dataframe(sales_df.head(30))
 
-    action_label = "Agregar carga y generar nuevas OTs" if batches else "Cargar y generar OTs"
-    if st.button(action_label):
+    if st.button("Cargar y generar OTs"):
         model = "VENTAS" if model_pick.startswith("Por ventas") else "SKU"
-        if batches:
-            result = append_orders_and_build_ots(
-                sales_df,
-                inv_map_sku,
-                int(num_pickers),
-                model=model,
-                familia_map_sku=familia_map_sku,
-                source_label=source_label,
-            )
-            if not result.get("created"):
-                if result.get("reason") == "duplicate":
-                    st.warning("No se agregó una nueva tanda porque todas las ventas de este archivo ya estaban cargadas en la corrida actual.")
-                else:
-                    st.warning("No se pudo crear una nueva tanda con este archivo.")
-            else:
-                st.session_state["picking_import_flash"] = f"Nueva tanda creada: {', '.join(result.get('picker_names', []))}. Ya puedes ir a Picking."
-                st.rerun()
-        else:
-            save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
-            st.session_state["picking_import_flash"] = "OTs creadas. Anda a Picking y selecciona P1, P2, ..."
-            st.rerun()
+        save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
+        st.success("OTs creadas. Anda a Picking y selecciona P1, P2, ...")
 
 
 # =========================
@@ -4217,145 +3879,153 @@ def _s2_close_manifest(mid: int):
     conn.commit()
     conn.close()
 
-def _s2_create_new_manifest(status: str = 'STAGED') -> int:
-    """Creates a new manifest and returns its id.
-    STAGED = cargado pero todavía no liberado a producción.
-    ACTIVE = corridas creadas y listo para camarero.
-    """
+def _s2_create_new_manifest() -> int:
+    """Creates a new ACTIVE manifest and returns its id."""
     _s2_create_tables()
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES(?, ?);", (str(status or 'STAGED').upper(), _s2_now_iso()))
+    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
     mid = int(c.lastrowid)
     conn.commit()
     conn.close()
     return mid
 
 
-def _s2_manifest_has_content(mid: int) -> bool:
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    sales = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    items = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    labels = int(c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    pages = int(c.execute("SELECT COUNT(*) FROM s2_page_assign WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-    files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
-    conn.close()
-    has_files = bool(files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))
-    return any([sales, items, labels, pages, has_files])
-
-
-def _s2_list_work_manifests():
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("SELECT id, status, created_at FROM s2_manifests WHERE status IN ('ACTIVE','STAGED') ORDER BY id DESC;").fetchall()
-    out = []
-    for mid, status, created_at in rows:
-        mesas = [int(r[0]) for r in c.execute("SELECT DISTINCT mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY mesa;", (int(mid),)).fetchall() if r[0] is not None]
-        sales_total = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-        sales_pending = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status!='DONE';", (int(mid),)).fetchone()[0] or 0)
-        items_total = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-        items_pending = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='PENDING';", (int(mid),)).fetchone()[0] or 0)
-        files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
-        out.append({
-            'id': int(mid),
-            'status': str(status),
-            'created_at': str(created_at or ''),
-            'mesas': mesas,
-            'sales_total': sales_total,
-            'sales_pending': sales_pending,
-            'items_total': items_total,
-            'items_pending': items_pending,
-            'control_name': str(files[0] or '') if files else '',
-            'labels_name': str(files[1] or '') if files else '',
-            'has_content': bool(sales_total or items_total or mesas or (files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))),
-        })
-    conn.close()
-    return out
-
-
-def _s2_list_open_manifests():
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("SELECT id, status, created_at FROM s2_manifests WHERE status='ACTIVE' ORDER BY id DESC;").fetchall()
-    out = []
-    for mid, status, created_at in rows:
-        mesas = [int(r[0]) for r in c.execute("SELECT DISTINCT mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY mesa;", (int(mid),)).fetchall() if r[0] is not None]
-        sales_total = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-        sales_pending = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status!='DONE';", (int(mid),)).fetchone()[0] or 0)
-        items_total = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
-        items_pending = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='PENDING';", (int(mid),)).fetchone()[0] or 0)
-        files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
-        out.append({
-            'id': int(mid),
-            'status': str(status),
-            'created_at': str(created_at or ''),
-            'mesas': mesas,
-            'sales_total': sales_total,
-            'sales_pending': sales_pending,
-            'items_total': items_total,
-            'items_pending': items_pending,
-            'control_name': str(files[0] or '') if files else '',
-            'labels_name': str(files[1] or '') if files else '',
-            'has_content': bool(sales_total or items_total or mesas or (files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))),
-        })
-    conn.close()
-    return out
-
-
-def _s2_get_locked_mesas(exclude_mid: int | None = None):
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    if exclude_mid is None:
-        rows = c.execute("""SELECT DISTINCT p.mesa
-                            FROM s2_page_assign p
-                            JOIN s2_manifests m ON m.id = p.manifest_id
-                            WHERE m.status IN ('ACTIVE','STAGED')
-                            ORDER BY p.mesa;""").fetchall()
-    else:
-        rows = c.execute("""SELECT DISTINCT p.mesa
-                            FROM s2_page_assign p
-                            JOIN s2_manifests m ON m.id = p.manifest_id
-                            WHERE m.status IN ('ACTIVE','STAGED') AND p.manifest_id<>?
-                            ORDER BY p.mesa;""", (int(exclude_mid),)).fetchall()
-    conn.close()
-    return [int(r[0]) for r in rows if r[0] is not None]
-
-
-def _s2_next_global_mesa_block(default_count: int = 3, exclude_mid: int | None = None):
-    locked = _s2_get_locked_mesas(exclude_mid=exclude_mid)
-    start = int(max(locked) + 1) if locked else 1
-    return start, max(1, int(default_count or 1))
-
-
-def _s2_find_manifest_by_mesa(mesa: int):
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute("""SELECT p.manifest_id
-                       FROM s2_page_assign p
-                       JOIN s2_manifests m ON m.id = p.manifest_id
-                       WHERE m.status IN ('ACTIVE','STAGED') AND p.mesa=?
-                       ORDER BY p.manifest_id DESC
-                       LIMIT 1;""", (int(mesa),)).fetchone()
-    conn.close()
-    return int(row[0]) if row else None
-
-
 def _s2_delete_manifest(mid: int):
-    _s2_create_tables()
+    """Delete one sorting lot completely and free its mesas."""
+    mid = int(mid)
     conn = get_conn()
     c = conn.cursor()
-    mid = int(mid)
-    for tbl in ['s2_dispatch', 's2_pack_ship', 's2_packing', 's2_labels', 's2_items', 's2_sales', 's2_page_assign', 's2_files']:
-        c.execute(f"DELETE FROM {tbl} WHERE manifest_id=?;", (mid,))
-    c.execute("DELETE FROM s2_manifests WHERE id=?;", (mid,))
+    for t in [
+        's2_page_assign', 's2_pack_ship', 's2_labels', 's2_items',
+        's2_sales', 's2_files', 's2_dispatch', 's2_packing', 's2_manifests'
+    ]:
+        try:
+            c.execute(f"DELETE FROM {t} WHERE manifest_id=?;", (mid,))
+        except Exception:
+            pass
+    try:
+        c.execute("DELETE FROM s2_manifests WHERE id=?;", (mid,))
+    except Exception:
+        pass
     conn.commit()
     conn.close()
+
+
+def _s2_get_open_manifests():
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, status, created_at FROM s2_manifests WHERE status='ACTIVE' ORDER BY created_at, id;"
+    ).fetchall()
+    out = []
+    for idx, row in enumerate(rows, start=1):
+        mid = int(row[0])
+        stats = _s2_get_stats(mid)
+        mesas = [int(x[0]) for x in c.execute(
+            "SELECT DISTINCT mesa FROM s2_sales WHERE manifest_id=? AND mesa IS NOT NULL ORDER BY mesa;",
+            (mid,),
+        ).fetchall()]
+        frow = c.execute(
+            "SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?;",
+            (mid,),
+        ).fetchone()
+        out.append({
+            'idx': idx,
+            'mid': mid,
+            'status': str(row[1]),
+            'created_at': row[2],
+            'mesas': mesas,
+            'stats': stats,
+            'control_name': (frow[0] if frow else ''),
+            'labels_name': (frow[1] if frow else ''),
+            'updated_at': (frow[2] if frow else ''),
+        })
+    conn.close()
+    return out
+
+
+def _s2_get_taken_mesas(exclude_mid: int | None = None) -> list[int]:
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    sql = (
+        "SELECT DISTINCT s.mesa FROM s2_sales s "
+        "JOIN s2_manifests m ON m.id=s.manifest_id "
+        "WHERE m.status='ACTIVE' AND s.mesa IS NOT NULL"
+    )
+    params = []
+    if exclude_mid is not None:
+        sql += " AND s.manifest_id<>?"
+        params.append(int(exclude_mid))
+    sql += " ORDER BY s.mesa;"
+    rows = c.execute(sql, tuple(params)).fetchall()
+    conn.close()
+    return [int(r[0]) for r in rows if r and r[0] is not None]
+
+
+def _s2_default_block_size() -> int:
+    lots = _s2_get_open_manifests()
+    if lots:
+        last = lots[-1]
+        n = len(last.get('mesas') or [])
+        if n > 0:
+            return max(1, int(n))
+    return int(S2_DEFAULT_BLOCK_MESAS)
+
+
+def _s2_next_block_mesas(block_size: int | None = None, exclude_mid: int | None = None) -> list[int]:
+    size = max(1, int(block_size or _s2_default_block_size() or 1))
+    taken = _s2_get_taken_mesas(exclude_mid=exclude_mid)
+    start = (max(taken) + 1) if taken else 1
+    return list(range(start, start + size))
+
+
+def _s2_assign_pages_to_mesas(mid: int, mesas: list[int]) -> int:
+    pages = _s2_get_pages(mid)
+    if not pages or not mesas:
+        return 0
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (int(mid),))
+    for i, p in enumerate(pages):
+        mesa = int(mesas[i % len(mesas)])
+        c.execute(
+            """INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
+                     VALUES(?,?,?)
+                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""",
+            (int(mid), int(p), mesa),
+        )
+    conn.commit()
+    conn.close()
+    return len(pages)
+
+
+def _s2_mesas_text(mesas: list[int]) -> str:
+    vals = [int(x) for x in (mesas or [])]
+    if not vals:
+        return '-'
+    if len(vals) == 1:
+        return str(vals[0])
+    return f"{min(vals)} a {max(vals)}"
+
+
+def _s2_find_manifest_for_mesa(mesa: int):
+    mesa = int(mesa)
+    lots = _s2_get_open_manifests()
+    for lot in lots:
+        if mesa in (lot.get('mesas') or []):
+            return lot['mid']
+    return None
+
+
+def _s2_lot_label(mid: int) -> str:
+    lots = _s2_get_open_manifests()
+    for lot in lots:
+        if int(lot['mid']) == int(mid):
+            return f"Lote {lot['idx']}"
+    return "Lote"
 
 
 
@@ -5219,149 +4889,6 @@ def _s2_auto_assign_pages(mid:int, num_mesas:int=10):
     conn.close()
     return len(pages)
 
-def _s2_next_mesa_block(mid: int, default_count: int = 3):
-    assigns = _s2_get_assignments(mid)
-    if not assigns:
-        return 1, int(default_count)
-    mesas = sorted({int(m) for _, m in assigns if m is not None})
-    mesas_count = int(len(mesas) or default_count)
-    next_start = int(max(mesas) + 1) if mesas else 1
-    return next_start, mesas_count
-
-
-def _s2_auto_assign_specific_pages(mid: int, pages: list[int], start_mesa: int = 1, mesas_count: int = 3):
-    pages = [int(p) for p in pages or []]
-    if not pages:
-        return 0
-    mesas_count = max(1, int(mesas_count or 1))
-    start_mesa = max(1, int(start_mesa or 1))
-    conn = get_conn()
-    c = conn.cursor()
-    for i, p in enumerate(sorted(set(pages))):
-        mesa = start_mesa + (i % mesas_count)
-        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
-                     VALUES(?,?,?)
-                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (mid, p, mesa))
-    conn.commit()
-    conn.close()
-    return len(set(pages))
-
-
-def _s2_build_assignment_preview(pages: list[int], start_mesa: int = 1, mesas_count: int = 3):
-    pages = sorted({int(p) for p in (pages or [])})
-    mesas_count = max(1, int(mesas_count or 1))
-    start_mesa = max(1, int(start_mesa or 1))
-    preview = []
-    for i, p in enumerate(pages):
-        preview.append({"Página": int(p), "Mesa": int(start_mesa + (i % mesas_count))})
-    return preview
-
-
-def _s2_append_labels(mid: int, labels_name: str, labels_bytes: bytes):
-    pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
-    try:
-        txt = labels_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        txt = str(labels_bytes)
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    prev = c.execute("SELECT labels_name FROM s2_files WHERE manifest_id=?;", (mid,)).fetchone()
-    prev_name = str(prev[0] or "").strip() if prev else ""
-    merged_name = labels_name if not prev_name else f"{prev_name} + {labels_name}"
-
-    c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
-                 VALUES(?, ?, ?, ?)
-                 ON CONFLICT(manifest_id) DO UPDATE SET
-                    labels_name=excluded.labels_name,
-                    updated_at=excluded.updated_at;""", (mid, labels_bytes, merged_name, _s2_now_iso()))
-
-    for sid in shipment_ids:
-        c.execute("INSERT OR IGNORE INTO s2_labels(manifest_id, shipment_id, raw) VALUES(?,?,NULL);", (mid, str(sid)))
-
-    if pack_to_ship:
-        for pack_id, ship_id in pack_to_ship.items():
-            c.execute("INSERT OR REPLACE INTO s2_pack_ship(manifest_id, pack_id, shipment_id) VALUES(?,?,?);", (mid, str(pack_id), str(ship_id)))
-        try:
-            c.execute("""UPDATE s2_sales
-                           SET shipment_id = (
-                               SELECT ps.shipment_id FROM s2_pack_ship ps
-                               WHERE ps.manifest_id=s2_sales.manifest_id AND ps.pack_id=s2_sales.pack_id
-                           )
-                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL AND pack_id!='';""", (mid,))
-        except Exception:
-            pass
-
-    if sale_to_ship:
-        try:
-            for sale_id, ship_id in sale_to_ship.items():
-                c.execute("""UPDATE s2_sales
-                             SET shipment_id=?
-                             WHERE manifest_id=? AND sale_id=? AND (shipment_id IS NULL OR shipment_id='');""",
-                          (str(ship_id), mid, str(sale_id)))
-        except Exception:
-            pass
-
-    import re
-    blocks = re.split(r"\^XA", txt)
-    for b in blocks:
-        if not b.strip():
-            continue
-        raw_block = "^XA" + b
-
-        ship = None
-        jm = re.search(r'"id"\s*:\s*"(\d{8,15})"', raw_block)
-        if jm:
-            ship = jm.group(1)
-        if not ship:
-            nums = re.findall(r"\d{10,15}", raw_block)
-            if nums:
-                nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
-                ship = nums_sorted[0]
-        if not ship:
-            continue
-
-        c.execute("""UPDATE s2_labels SET raw=? WHERE manifest_id=? AND shipment_id=?;""", (raw_block, mid, str(ship)))
-        info = _s2_parse_label_raw_info(raw_block)
-        if not info:
-            continue
-        customer = _s2_clean_person_text(info.get("destinatario"), 70)
-        destino_parts = []
-        dom = _s2_clean_person_text(info.get("domicilio"), 120)
-        city = _s2_clean_person_text(info.get("ciudad_destino"), 80)
-        if dom:
-            destino_parts.append(dom)
-        if city:
-            destino_parts.append(city)
-        destino = " - ".join([p for p in destino_parts if p]) if destino_parts else None
-        destino = _s2_clean_person_text(destino, 160) if destino else None
-        comuna = _s2_clean_person_text(info.get("comuna"), 60)
-        ciudad_dest = _s2_clean_person_text(info.get("ciudad_destino"), 80)
-        fields, params = [], []
-        if customer:
-            fields.append("customer=?")
-            params.append(customer)
-        if destino:
-            fields.append("destino=?")
-            params.append(destino)
-        if comuna:
-            fields.append("comuna=?")
-            params.append(comuna)
-        if ciudad_dest:
-            fields.append("ciudad_destino=?")
-            params.append(ciudad_dest)
-        if fields:
-            params.extend([mid, str(ship)])
-            c.execute(f"""UPDATE s2_sales
-                             SET {', '.join(fields)}
-                             WHERE manifest_id=? AND shipment_id=?;""", tuple(params))
-
-    conn.commit()
-    conn.close()
-    return len(shipment_ids)
-
-
 def _s2_get_assignments(mid:int):
     conn=get_conn()
     c=conn.cursor()
@@ -5380,7 +4907,7 @@ def _s2_set_assignment(mid:int, page_no:int, mesa:int):
     conn.close()
 
 def _s2_create_corridas(mid:int):
-    # apply mesa from page assignments to sales y liberar a producción
+    # apply mesa from page assignments to sales
     conn=get_conn()
     c=conn.cursor()
     c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=?;", (mid,))
@@ -5397,7 +4924,6 @@ def _s2_create_corridas(mid:int):
                      SET mesa=?, status='PENDING', opened_at=NULL, closed_at=NULL
                      WHERE manifest_id=? AND sale_id=?;""", (mesa, mid, sale_id))
         updated += 1
-    c.execute("UPDATE s2_manifests SET status='ACTIVE' WHERE id=?;", (int(mid),))
     conn.commit()
     conn.close()
     return updated
@@ -5489,56 +5015,17 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Sorting - Carga y Corridas")
 
-    work_manifests = _s2_list_work_manifests()
-    staged = [m for m in work_manifests if str(m.get('status')) == 'STAGED']
-    open_manifests = _s2_list_open_manifests()
-    if staged:
-        mid = int(staged[0]['id'])
-    else:
-        mid = _s2_create_new_manifest('STAGED')
-        work_manifests = _s2_list_work_manifests()
-        staged = [m for m in work_manifests if str(m.get('status')) == 'STAGED']
+    mid = _s2_get_active_manifest_id()
     st.session_state["sorting_manifest_id"] = mid
 
-    locked_mesas_all = _s2_get_locked_mesas()
-    stats = _s2_get_stats(mid)
+    st.caption(f"Manifiesto activo: {mid}")
+
     files_state = _s2_manifest_files_state(mid)
-    has_existing_pages = bool(_s2_get_pages(mid))
+    lock_control = bool(files_state.get("has_control"))
+    if lock_control:
+        st.warning("🔒 Ya hay un Control cargado en el manifiesto activo. Para cargar un manifiesto nuevo debes **Cerrar** o **Reiniciar** el Sorting desde Administrador.")
 
-    current_status = 'STAGED'
-    for _mf in _s2_list_work_manifests():
-        if int(_mf['id']) == int(mid):
-            current_status = str(_mf.get('status') or 'STAGED')
-            break
-    st.caption(f"Manifiesto de trabajo visible: {mid} · Estado: {current_status}")
-    if _s2_list_work_manifests():
-        resumen = []
-        for mf in _s2_list_work_manifests():
-            mesas_txt = ", ".join(map(str, mf["mesas"])) if mf["mesas"] else "-"
-            progreso = f"{max(0, mf['sales_total'] - mf['sales_pending'])}/{mf['sales_total']}" if mf['sales_total'] else "0/0"
-            resumen.append({
-                "Manifiesto": mf["id"],
-                "Estado": mf.get('status','-'),
-            "Mesas": mesas_txt,
-                "Ventas": mf["sales_total"],
-                "Avance ventas": progreso,
-            })
-        with st.expander("Manifiestos abiertos", expanded=True):
-            st.dataframe(resumen, use_container_width=True, hide_index=True)
-
-    top1, top2, top3, top4 = st.columns(4)
-    top1.metric("Ventas activas", stats["ventas"])
-    top2.metric("Items", stats["items"])
-    top3.metric("Etiquetas", stats["etiquetas"])
-    top4.metric("Envíos únicos", stats["distinct_ship_labels"])
-
-    assigns_now = _s2_get_assignments(mid)
-    mesas_mid = sorted({int(m) for _, m in assigns_now})
-    if mesas_mid:
-        st.info(f"El manifiesto {mid} usa las mesas: {', '.join(map(str, mesas_mid))}")
-    if locked_mesas_all:
-        st.caption(f"Mesas bloqueadas por manifiestos abiertos: {', '.join(map(str, locked_mesas_all))}")
-
+    
     mode = st.radio(
         "Modo de carga",
         ["Uno (1 Control + 1 Etiquetas)", "Varios (lote: varios Controles + varias Etiquetas)"],
@@ -5547,78 +5034,31 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     )
 
     if mode.startswith("Uno"):
-        if st.session_state.get("s2_upload_flash"):
-            st.success(st.session_state.get("s2_upload_flash"))
-            st.session_state["s2_upload_flash"] = ""
-
         col1, col2 = st.columns(2)
         with col1:
-            pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf")
+            pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf", disabled=lock_control)
         with col2:
             zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
 
-        st.caption("La carga no se procesa automáticamente. Primero sube los archivos y luego confirma con el botón.")
+        if pdf is not None:
+            # Limpia asignaciones de páginas previas (por si el manifiesto se reutiliza)
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
+            c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
+            conn.commit()
+            conn.close()
 
-        if pdf is not None or zpl is not None:
-            current_has_content = _s2_manifest_has_content(mid)
-            target_mid_preview = mid if not current_has_content else None
-            next_start_preview, mesa_block_preview = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid_preview)
-            with st.container(border=True):
-                st.markdown("**Resumen de la carga lista para confirmar**")
-                st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
-                st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
-                if current_has_content:
-                    st.caption("Esta carga se guardará en un **nuevo manifiesto en preparación** para no superponer el actual.")
-                else:
-                    st.caption(f"Esta será la carga inicial del manifiesto **{mid}**.")
-                st.caption(f"Las páginas nuevas partirán desde mesa **{next_start_preview}** usando un bloque de **{mesa_block_preview}** mesa(s).")
-                if pdf is not None:
-                    try:
-                        parsed_preview = _s2_parse_control_pdf(pdf.getvalue())
-                        preview_pages = sorted({int(r.get("page_no") or 1) for r in parsed_preview})
-                    except Exception:
-                        preview_pages = []
-                    if preview_pages:
-                        st.write(f"**Páginas detectadas en el Control:** {len(preview_pages)}")
-                        preview_rows = _s2_build_assignment_preview(preview_pages, start_mesa=next_start_preview, mesas_count=mesa_block_preview)
-                        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No pude previsualizar las páginas del Control antes de confirmar, pero la carga igual se podrá procesar.")
+            n_sales = _s2_upsert_control(mid, getattr(pdf, "name", "control.pdf"), pdf.getvalue())
+            st.success(f"Control cargado. Ventas detectadas: {n_sales}")
+            _s2_auto_assign_pages(mid, num_mesas=10)
 
-        process_one = st.button(
-            "Confirmar carga de Control + Etiquetas",
-            type="primary",
-            disabled=(pdf is None and zpl is None),
-            key="s2_process_single_upload",
-        )
-
-        if process_one:
-            if pdf is None:
-                st.error("Debes subir el Control (PDF) antes de confirmar la carga.")
-            elif zpl is None:
-                st.error("Debes subir también las Etiquetas (TXT/ZPL) antes de confirmar la carga.")
-            else:
-                pdf_name = getattr(pdf, "name", "control.pdf")
-                pdf_bytes = pdf.getvalue()
-                zpl_name = getattr(zpl, "name", "etiquetas.txt")
-                zpl_bytes = zpl.getvalue()
-
-                target_mid = mid if not _s2_manifest_has_content(mid) else _s2_create_new_manifest('STAGED')
-                next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
-                n_sales = _s2_upsert_control(target_mid, pdf_name, pdf_bytes)
-                _s2_auto_assign_specific_pages(target_mid, _s2_get_pages(target_mid), start_mesa=next_start, mesas_count=mesa_block)
-                n_labels = _s2_upsert_labels(target_mid, zpl_name, zpl_bytes)
-
-                st.session_state["sorting_manifest_id"] = target_mid
-                st.session_state["s2_upload_flash"] = f"Manifiesto {target_mid} cargado en preparación: {n_sales} ventas y {n_labels} etiquetas. Mesas reservadas desde {next_start}. Aún no está en producción hasta crear corridas."
-
-                for k in ("s2_control_pdf", "s2_labels_txt"):
-                    if k in st.session_state:
-                        del st.session_state[k]
-                st.rerun()
+        if zpl is not None:
+            n_labels = _s2_upsert_labels(mid, getattr(zpl, "name", "etiquetas.txt"), zpl.getvalue())
+            st.success(f"Etiquetas cargadas. IDs detectados: {n_labels}")
 
     else:
-        st.info("📦 Lote: se suman las páginas de todos los Controles sin borrar la carga anterior. Cada lote nuevo se manda a mesas nuevas automáticamente.")
+        st.info("📦 Lote: se suman las páginas de todos los Controles (sin mezclar). Ej: 5 + 5 => 10 páginas para asignar a mesas.")
         col1, col2 = st.columns(2)
         with col1:
             pdfs = st.file_uploader(
@@ -5626,6 +5066,7 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 type=["pdf"],
                 accept_multiple_files=True,
                 key="s2_control_pdfs",
+                disabled=lock_control,
             )
         with col2:
             zpls = st.file_uploader(
@@ -5638,60 +5079,79 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         do_batch = st.button(
             "Procesar lote en una sola tanda",
             type="primary",
-            disabled=(not pdfs and not zpls),
+            disabled=lock_control or (not pdfs and not zpls),
             key="s2_do_batch",
         )
 
         if do_batch:
+            # Limpieza dura del manifiesto activo (solo datos del Sorting v2 del manifiesto)
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
+            c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
+            c.execute("DELETE FROM s2_labels WHERE manifest_id=?;", (mid,))
+            c.execute("DELETE FROM s2_items WHERE manifest_id=?;", (mid,))
+            c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
+            conn.commit()
+            conn.close()
+
+            # 1) Controles: append con offset de páginas
             total_sales = 0
             if pdfs:
-                prev_pages = set(_s2_get_pages(mid))
-                offset = _s2_get_max_page(mid)
-                next_start, mesa_block = _s2_next_mesa_block(mid, default_count=max(1, len({m for _, m in assigns_now}) or 3))
+                offset = 0
                 names = []
                 for i, pdf in enumerate(pdfs):
-                    name = getattr(pdf, "name", f"control_{i+1}.pdf")
-                    names.append(name)
-                    added = _s2_append_control(mid, name, pdf.getvalue(), page_offset=offset)
+                    names.append(getattr(pdf, "name", f"control_{i+1}.pdf"))
+                    added = _s2_append_control(mid, names[-1], pdf.getvalue(), page_offset=offset)
                     total_sales += int(added or 0)
                     offset = _s2_get_max_page(mid)
-                new_pages = [p for p in _s2_get_pages(mid) if p not in prev_pages]
-                _s2_auto_assign_specific_pages(mid, new_pages, start_mesa=next_start, mesas_count=mesa_block)
-                try:
-                    conn = get_conn()
-                    c = conn.cursor()
-                    prev = c.execute("SELECT control_name FROM s2_files WHERE manifest_id=?;", (mid,)).fetchone()
-                    prev_name = str(prev[0] or "").strip() if prev else ""
-                    merged = " + ".join(names) if not prev_name else f"{prev_name} + {' + '.join(names)}"
-                    first_pdf = pdfs[0].getvalue() if pdfs else None
-                    c.execute(
-                        """INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
-                             VALUES(?, ?, ?, ?)
-                             ON CONFLICT(manifest_id) DO UPDATE SET
-                                control_name=excluded.control_name,
-                                updated_at=excluded.updated_at;""",
-                        (mid, first_pdf, merged, _s2_now_iso()),
-                    )
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    pass
-                st.success(f"Controles agregados en lote. Ventas detectadas: {total_sales}. Mesas nuevas desde {next_start}.")
 
+                # Guarda referencia del lote en s2_files (solo como registro)
+                try:
+                    first_pdf = pdfs[0].getvalue()
+                except Exception:
+                    first_pdf = None
+                conn = get_conn()
+                c = conn.cursor()
+                c.execute(
+                    """INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
+                         VALUES(?, ?, ?, ?)
+                         ON CONFLICT(manifest_id) DO UPDATE SET
+                            control_pdf=excluded.control_pdf,
+                            control_name=excluded.control_name,
+                            updated_at=excluded.updated_at;""",
+                    (mid, first_pdf, "LOTE: " + " + ".join(names), _s2_now_iso()),
+                )
+                conn.commit()
+                conn.close()
+
+                st.success(f"Controles procesados en lote. Ventas totales detectadas: {total_sales}")
+                _s2_auto_assign_pages(mid, num_mesas=10)
+
+            # 2) Etiquetas: concatenar y cargar 1 sola vez
             if zpls:
-                total_labels = 0
+                parts = []
                 zpl_names = []
                 for i, z in enumerate(zpls):
                     zpl_names.append(getattr(z, "name", f"etiquetas_{i+1}.txt"))
-                    if stats["etiquetas"] > 0 or total_labels > 0:
-                        total_labels += int(_s2_append_labels(mid, zpl_names[-1], z.getvalue()) or 0)
-                    else:
-                        total_labels += int(_s2_upsert_labels(mid, zpl_names[-1], z.getvalue()) or 0)
-                st.success(f"Etiquetas procesadas en lote. IDs detectados: {total_labels}")
+                    try:
+                        parts.append(z.getvalue())
+                    except Exception:
+                        pass
+                labels_bytes = b"\n\n".join([p for p in parts if p])
+                n_labels = _s2_upsert_labels(mid, "LOTE: " + " + ".join(zpl_names), labels_bytes)
+                st.success(f"Etiquetas procesadas en lote. IDs detectados: {n_labels}")
 
+    # Resumen
+
+    # Resumen (para evitar confusión: ventas y etiquetas NO siempre coinciden 1:1)
     stats = _s2_get_stats(mid)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ventas (Control)", stats["ventas"])
+    c2.metric("Items (líneas)", stats["items"])
+    c3.metric("Etiquetas (total)", stats["etiquetas"])
+    c4.metric("Envíos únicos (labels)", stats["distinct_ship_labels"])
 
-    st.subheader("Resumen de conciliación")
     with st.expander("Ver detalle de conciliación", expanded=False):
         st.write(
             {
@@ -5707,42 +5167,25 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
 
     pages = _s2_get_pages(mid)
     if not pages:
-        st.info("Sube Control + Etiquetas y confirma la carga para continuar.")
+        st.info("Sube el Control.pdf para continuar.")
         return
-
-    if current_status == 'STAGED':
-        st.warning("Este manifiesto está en preparación. Todavía no está liberado a producción hasta que presiones Crear corridas.")
 
     st.subheader("Asignación Página → Mesa")
     assigns = dict(_s2_get_assignments(mid))
-    locked_other = set(_s2_get_locked_mesas(exclude_mid=mid))
-    if locked_other:
-        st.warning(f"Mesas bloqueadas por otros manifiestos abiertos: {', '.join(map(str, sorted(locked_other)))}")
-    preview_actual = [{"Página": int(p), "Mesa": int(assigns.get(p, 1))} for p in pages]
-    if preview_actual:
-        st.dataframe(preview_actual, use_container_width=True, hide_index=True)
     for p in pages:
         cur = assigns.get(p, 1)
-        new_mesa = st.number_input(f"Página {p} → Mesa", min_value=1, max_value=50, value=int(cur), key=f"s2_mesa_{mid}_{p}")
+        new_mesa = st.number_input(f"Página {p} → Mesa", min_value=1, max_value=50, value=int(cur), key=f"s2_mesa_{p}")
         if int(new_mesa) != int(cur):
-            if int(new_mesa) in locked_other:
-                st.error(f"La mesa {int(new_mesa)} está bloqueada por otro manifiesto abierto. Ciérralo o elimínalo antes de reutilizar esa mesa.")
-            else:
-                _s2_set_assignment(mid, p, int(new_mesa))
-                st.rerun()
+            _s2_set_assignment(mid, p, int(new_mesa))
 
+    # Validate all pages assigned
     assigns = dict(_s2_get_assignments(mid))
     missing = [p for p in pages if p not in assigns]
     if missing:
         st.warning(f"Faltan páginas por asignar: {missing}")
         if st.button("Auto-asignar faltantes", use_container_width=True):
-            start_mesa, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=mid)
-            _s2_auto_assign_specific_pages(mid, missing, start_mesa=start_mesa, mesas_count=mesa_block)
+            _s2_auto_assign_pages(mid, num_mesas=10)
             st.rerun()
-
-    _s2_created_flash = st.session_state.pop("s2_created_flash", None)
-    if _s2_created_flash:
-        st.success(_s2_created_flash)
 
     st.divider()
     if st.button("✅ Crear corridas", use_container_width=True):
@@ -5750,14 +5193,15 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         if created <= 0:
             st.error("No se crearon corridas. Revisa asignación de páginas.")
         else:
+            st.success(f"Corridas creadas/actualizadas: {created}")
             st.session_state["s2_last_created"] = created
-            st.session_state["s2_created_flash"] = f"Corridas creadas/actualizadas correctamente: {created}"
-            st.rerun()
 
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Camarero")
     st.caption("Escaneo por etiqueta (Flex/Colecta) y productos por SKU/EAN")
+    mid = _s2_get_active_manifest_id()
+    st.session_state["sorting_manifest_id"] = mid
 
     mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
     st.session_state["s2_mesa_int"] = int(mesa)  # store separately; do not overwrite widget key
@@ -5765,18 +5209,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     # State: current sale
     if "s2_sale_open" not in st.session_state:
         st.session_state["s2_sale_open"] = None
-    if "s2_sale_open_manifest_id" not in st.session_state:
-        st.session_state["s2_sale_open_manifest_id"] = None
-
-    if st.session_state["s2_sale_open"] is not None and st.session_state.get("s2_sale_open_manifest_id"):
-        mid = int(st.session_state["s2_sale_open_manifest_id"])
-    else:
-        mid = _s2_find_manifest_by_mesa(int(mesa))
-        if not mid:
-            st.warning(f"La mesa {int(mesa)} no está asignada a ningún manifiesto abierto.")
-            return
-    st.session_state["sorting_manifest_id"] = mid
-    st.caption(f"Manifiesto detectado para esta mesa: {mid}")
 
     if st.session_state["s2_sale_open"] is None:
         st.subheader("Escanea etiqueta (QR Flex o barra Colecta)")
@@ -5828,7 +5260,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                         sfx_emit("ERR")
                 else:
                     st.session_state["s2_sale_open"] = sale_id
-                    st.session_state["s2_sale_open_manifest_id"] = mid
                     st.session_state["s2_clear_label_scan"] = True
                     sfx_emit("OK")
                     st.rerun()
@@ -6031,7 +5462,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             if st.button("✅ Cerrar venta y volver a escanear etiqueta", key=f"s2_close_{sale_id}", use_container_width=True, disabled=not confirm_close):
                 _s2_close_sale(mid, sale_id)
                 st.session_state["s2_sale_open"] = None
-                st.session_state["s2_sale_open_manifest_id"] = None
                 st.session_state["s2_clear_prod_scan"] = True
                 st.session_state["s2_clear_label_scan"] = True
                 st.rerun()
@@ -6047,31 +5477,15 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     # Respaldo/Restauración SOLO SORTING (no afecta otros módulos)
     _render_module_backup_ui("sorting", "Sorting", SORTING_TABLES)
 
-    work_manifests = _s2_list_work_manifests()
-    if not work_manifests:
-        mid = _s2_create_new_manifest('STAGED')
-        work_manifests = _s2_list_work_manifests()
-    else:
-        default_mid = st.session_state.get("s2_admin_manifest_id")
-        manifest_ids = [int(m["id"]) for m in work_manifests]
-        mid = int(default_mid) if default_mid in manifest_ids else int(work_manifests[0]["id"])
+    # Manifiesto activo
+    try:
+        mid = _s2_get_active_manifest_id()
+    except Exception:
+        mid = None
 
-    st.subheader("Manifiestos abiertos y en preparación")
-    resumen = []
-    for mf in work_manifests:
-        mesas_txt = ", ".join(map(str, mf["mesas"])) if mf["mesas"] else "-"
-        resumen.append({
-            "Manifiesto": mf["id"],
-            "Estado": mf.get('status','-'),
-            "Mesas": mesas_txt,
-            "Ventas": mf["sales_total"],
-            "Pendientes": mf["sales_pending"],
-            "Control": mf["control_name"] or "-",
-            "Etiquetas": mf["labels_name"] or "-",
-        })
-    st.dataframe(resumen, use_container_width=True, hide_index=True)
-    manifest_ids = [int(m["id"]) for m in work_manifests]
-    mid = st.selectbox("Ver manifiesto", options=manifest_ids, index=manifest_ids.index(int(mid)), key="s2_admin_manifest_id")
+    if not mid:
+        st.warning("No hay manifiesto activo. Primero carga Control + Etiquetas y crea corridas.")
+        return
 
     conn = get_conn()
     c = conn.cursor()
@@ -6081,14 +5495,12 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     stats = _s2_get_stats(mid)
 
     # ---- Estado del manifiesto (como en Admin Picking: métricas arriba) ----
-    st.subheader("Estado del manifiesto")
+    st.subheader("Estado del manifiesto activo")
     colA, colB, colC, colD = st.columns(4)
-    current_status_admin = next((str(m.get('status')) for m in work_manifests if int(m['id']) == int(mid)), 'STAGED')
     colA.metric("Manifiesto ID", mid)
     colB.metric("Ventas (Control)", stats.get("ventas", 0))
     colC.metric("Items", stats.get("items", 0))
     colD.metric("Etiquetas", stats.get("etiquetas", 0))
-    st.caption(f"Estado actual: {current_status_admin}")
 
     if f:
         control_name, labels_name, updated_at = f
@@ -6252,36 +5664,12 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         )
 
     if btn_close:
-        mesas_liberadas = sorted({int(r[1]) for r in _s2_get_assignments(mid)})
         _s2_close_manifest(mid)
-        remaining = _s2_list_open_manifests()
-        if not remaining:
-            new_mid = _s2_create_new_manifest()
-            msg = f"Manifiesto {mid} cerrado. Mesas liberadas: {', '.join(map(str, mesas_liberadas)) if mesas_liberadas else '-'} · Nuevo manifiesto vacío: {new_mid}."
-        else:
-            msg = f"Manifiesto {mid} cerrado. Mesas liberadas: {', '.join(map(str, mesas_liberadas)) if mesas_liberadas else '-'}"
-        st.session_state["s2_upload_flash"] = msg
-        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id"]:
-            if k in st.session_state:
+        new_mid = _s2_create_new_manifest()
+        for k in list(st.session_state.keys()):
+            if k.startswith("s2_") or "sorting" in k:
                 del st.session_state[k]
-        st.rerun()
-
-    st.divider()
-    st.subheader("Eliminar manifiesto")
-    st.caption("Esto borra solo el manifiesto seleccionado y libera sus mesas para reutilizarlas.")
-    if f"s2_delete_confirm_{mid}" not in st.session_state:
-        st.session_state[f"s2_delete_confirm_{mid}"] = False
-    arm_delete = st.checkbox("Quiero eliminar este manifiesto", key=f"s2_delete_confirm_{mid}")
-    do_delete = st.button("🗑️ Eliminar manifiesto seleccionado", disabled=not arm_delete)
-    if do_delete:
-        mesas_liberadas = sorted({int(r[1]) for r in _s2_get_assignments(mid)})
-        _s2_delete_manifest(mid)
-        if not _s2_list_open_manifests():
-            _s2_create_new_manifest()
-        st.session_state["s2_upload_flash"] = f"Manifiesto {mid} eliminado. Mesas liberadas: {', '.join(map(str, mesas_liberadas)) if mesas_liberadas else '-'}"
-        for k in ["s2_sale_open", "s2_sale_open_manifest_id", "sorting_manifest_id", "s2_admin_manifest_id"]:
-            if k in st.session_state:
-                del st.session_state[k]
+        st.success(f"Manifiesto {mid} cerrado. Nuevo manifiesto activo: {new_mid}")
         st.rerun()
 
     # Reinicio al final (como en Admin Picking)
