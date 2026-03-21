@@ -4217,12 +4217,15 @@ def _s2_close_manifest(mid: int):
     conn.commit()
     conn.close()
 
-def _s2_create_new_manifest() -> int:
-    """Creates a new ACTIVE manifest and returns its id."""
+def _s2_create_new_manifest(status: str = 'STAGED') -> int:
+    """Creates a new manifest and returns its id.
+    STAGED = cargado pero todavía no liberado a producción.
+    ACTIVE = corridas creadas y listo para camarero.
+    """
     _s2_create_tables()
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
+    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES(?, ?);", (str(status or 'STAGED').upper(), _s2_now_iso()))
     mid = int(c.lastrowid)
     conn.commit()
     conn.close()
@@ -4241,6 +4244,36 @@ def _s2_manifest_has_content(mid: int) -> bool:
     conn.close()
     has_files = bool(files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))
     return any([sales, items, labels, pages, has_files])
+
+
+def _s2_list_work_manifests():
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    rows = c.execute("SELECT id, status, created_at FROM s2_manifests WHERE status IN ('ACTIVE','STAGED') ORDER BY id DESC;").fetchall()
+    out = []
+    for mid, status, created_at in rows:
+        mesas = [int(r[0]) for r in c.execute("SELECT DISTINCT mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY mesa;", (int(mid),)).fetchall() if r[0] is not None]
+        sales_total = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+        sales_pending = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status!='DONE';", (int(mid),)).fetchone()[0] or 0)
+        items_total = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (int(mid),)).fetchone()[0] or 0)
+        items_pending = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='PENDING';", (int(mid),)).fetchone()[0] or 0)
+        files = c.execute("SELECT control_name, labels_name FROM s2_files WHERE manifest_id=?;", (int(mid),)).fetchone()
+        out.append({
+            'id': int(mid),
+            'status': str(status),
+            'created_at': str(created_at or ''),
+            'mesas': mesas,
+            'sales_total': sales_total,
+            'sales_pending': sales_pending,
+            'items_total': items_total,
+            'items_pending': items_pending,
+            'control_name': str(files[0] or '') if files else '',
+            'labels_name': str(files[1] or '') if files else '',
+            'has_content': bool(sales_total or items_total or mesas or (files and ((files[0] and str(files[0]).strip()) or (files[1] and str(files[1]).strip())))),
+        })
+    conn.close()
+    return out
 
 
 def _s2_list_open_manifests():
@@ -4281,13 +4314,13 @@ def _s2_get_locked_mesas(exclude_mid: int | None = None):
         rows = c.execute("""SELECT DISTINCT p.mesa
                             FROM s2_page_assign p
                             JOIN s2_manifests m ON m.id = p.manifest_id
-                            WHERE m.status='ACTIVE'
+                            WHERE m.status IN ('ACTIVE','STAGED')
                             ORDER BY p.mesa;""").fetchall()
     else:
         rows = c.execute("""SELECT DISTINCT p.mesa
                             FROM s2_page_assign p
                             JOIN s2_manifests m ON m.id = p.manifest_id
-                            WHERE m.status='ACTIVE' AND p.manifest_id<>?
+                            WHERE m.status IN ('ACTIVE','STAGED') AND p.manifest_id<>?
                             ORDER BY p.mesa;""", (int(exclude_mid),)).fetchall()
     conn.close()
     return [int(r[0]) for r in rows if r[0] is not None]
@@ -4306,7 +4339,7 @@ def _s2_find_manifest_by_mesa(mesa: int):
     row = c.execute("""SELECT p.manifest_id
                        FROM s2_page_assign p
                        JOIN s2_manifests m ON m.id = p.manifest_id
-                       WHERE m.status='ACTIVE' AND p.mesa=?
+                       WHERE m.status IN ('ACTIVE','STAGED') AND p.mesa=?
                        ORDER BY p.manifest_id DESC
                        LIMIT 1;""", (int(mesa),)).fetchone()
     conn.close()
@@ -5347,7 +5380,7 @@ def _s2_set_assignment(mid:int, page_no:int, mesa:int):
     conn.close()
 
 def _s2_create_corridas(mid:int):
-    # apply mesa from page assignments to sales
+    # apply mesa from page assignments to sales y liberar a producción
     conn=get_conn()
     c=conn.cursor()
     c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=?;", (mid,))
@@ -5364,6 +5397,7 @@ def _s2_create_corridas(mid:int):
                      SET mesa=?, status='PENDING', opened_at=NULL, closed_at=NULL
                      WHERE manifest_id=? AND sale_id=?;""", (mesa, mid, sale_id))
         updated += 1
+    c.execute("UPDATE s2_manifests SET status='ACTIVE' WHERE id=?;", (int(mid),))
     conn.commit()
     conn.close()
     return updated
@@ -5455,12 +5489,15 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Sorting - Carga y Corridas")
 
+    work_manifests = _s2_list_work_manifests()
+    staged = [m for m in work_manifests if str(m.get('status')) == 'STAGED']
     open_manifests = _s2_list_open_manifests()
-    if not open_manifests:
-        mid = _s2_create_new_manifest()
-        open_manifests = _s2_list_open_manifests()
+    if staged:
+        mid = int(staged[0]['id'])
     else:
-        mid = int(open_manifests[0]["id"])
+        mid = _s2_create_new_manifest('STAGED')
+        work_manifests = _s2_list_work_manifests()
+        staged = [m for m in work_manifests if str(m.get('status')) == 'STAGED']
     st.session_state["sorting_manifest_id"] = mid
 
     locked_mesas_all = _s2_get_locked_mesas()
@@ -5468,15 +5505,21 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     files_state = _s2_manifest_files_state(mid)
     has_existing_pages = bool(_s2_get_pages(mid))
 
-    st.caption(f"Manifiesto de trabajo visible: {mid}")
-    if open_manifests:
+    current_status = 'STAGED'
+    for _mf in _s2_list_work_manifests():
+        if int(_mf['id']) == int(mid):
+            current_status = str(_mf.get('status') or 'STAGED')
+            break
+    st.caption(f"Manifiesto de trabajo visible: {mid} · Estado: {current_status}")
+    if _s2_list_work_manifests():
         resumen = []
-        for mf in open_manifests:
+        for mf in _s2_list_work_manifests():
             mesas_txt = ", ".join(map(str, mf["mesas"])) if mf["mesas"] else "-"
             progreso = f"{max(0, mf['sales_total'] - mf['sales_pending'])}/{mf['sales_total']}" if mf['sales_total'] else "0/0"
             resumen.append({
                 "Manifiesto": mf["id"],
-                "Mesas": mesas_txt,
+                "Estado": mf.get('status','-'),
+            "Mesas": mesas_txt,
                 "Ventas": mf["sales_total"],
                 "Avance ventas": progreso,
             })
@@ -5525,7 +5568,7 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
                 st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
                 if current_has_content:
-                    st.caption("Esta carga se guardará en un **nuevo manifiesto** para no superponer el actual.")
+                    st.caption("Esta carga se guardará en un **nuevo manifiesto en preparación** para no superponer el actual.")
                 else:
                     st.caption(f"Esta será la carga inicial del manifiesto **{mid}**.")
                 st.caption(f"Las páginas nuevas partirán desde mesa **{next_start_preview}** usando un bloque de **{mesa_block_preview}** mesa(s).")
@@ -5560,14 +5603,14 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 zpl_name = getattr(zpl, "name", "etiquetas.txt")
                 zpl_bytes = zpl.getvalue()
 
-                target_mid = mid if not _s2_manifest_has_content(mid) else _s2_create_new_manifest()
+                target_mid = mid if not _s2_manifest_has_content(mid) else _s2_create_new_manifest('STAGED')
                 next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
                 n_sales = _s2_upsert_control(target_mid, pdf_name, pdf_bytes)
                 _s2_auto_assign_specific_pages(target_mid, _s2_get_pages(target_mid), start_mesa=next_start, mesas_count=mesa_block)
                 n_labels = _s2_upsert_labels(target_mid, zpl_name, zpl_bytes)
 
                 st.session_state["sorting_manifest_id"] = target_mid
-                st.session_state["s2_upload_flash"] = f"Manifiesto {target_mid} cargado: {n_sales} ventas y {n_labels} etiquetas. Mesas asignadas desde {next_start}."
+                st.session_state["s2_upload_flash"] = f"Manifiesto {target_mid} cargado en preparación: {n_sales} ventas y {n_labels} etiquetas. Mesas reservadas desde {next_start}. Aún no está en producción hasta crear corridas."
 
                 for k in ("s2_control_pdf", "s2_labels_txt"):
                     if k in st.session_state:
@@ -5666,6 +5709,9 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     if not pages:
         st.info("Sube Control + Etiquetas y confirma la carga para continuar.")
         return
+
+    if current_status == 'STAGED':
+        st.warning("Este manifiesto está en preparación. Todavía no está liberado a producción hasta que presiones Crear corridas.")
 
     st.subheader("Asignación Página → Mesa")
     assigns = dict(_s2_get_assignments(mid))
@@ -5996,21 +6042,22 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     # Respaldo/Restauración SOLO SORTING (no afecta otros módulos)
     _render_module_backup_ui("sorting", "Sorting", SORTING_TABLES)
 
-    open_manifests = _s2_list_open_manifests()
-    if not open_manifests:
-        mid = _s2_create_new_manifest()
-        open_manifests = _s2_list_open_manifests()
+    work_manifests = _s2_list_work_manifests()
+    if not work_manifests:
+        mid = _s2_create_new_manifest('STAGED')
+        work_manifests = _s2_list_work_manifests()
     else:
         default_mid = st.session_state.get("s2_admin_manifest_id")
-        manifest_ids = [int(m["id"]) for m in open_manifests]
-        mid = int(default_mid) if default_mid in manifest_ids else int(open_manifests[0]["id"])
+        manifest_ids = [int(m["id"]) for m in work_manifests]
+        mid = int(default_mid) if default_mid in manifest_ids else int(work_manifests[0]["id"])
 
-    st.subheader("Manifiestos abiertos")
+    st.subheader("Manifiestos abiertos y en preparación")
     resumen = []
-    for mf in open_manifests:
+    for mf in work_manifests:
         mesas_txt = ", ".join(map(str, mf["mesas"])) if mf["mesas"] else "-"
         resumen.append({
             "Manifiesto": mf["id"],
+            "Estado": mf.get('status','-'),
             "Mesas": mesas_txt,
             "Ventas": mf["sales_total"],
             "Pendientes": mf["sales_pending"],
@@ -6018,7 +6065,7 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
             "Etiquetas": mf["labels_name"] or "-",
         })
     st.dataframe(resumen, use_container_width=True, hide_index=True)
-    manifest_ids = [int(m["id"]) for m in open_manifests]
+    manifest_ids = [int(m["id"]) for m in work_manifests]
     mid = st.selectbox("Ver manifiesto", options=manifest_ids, index=manifest_ids.index(int(mid)), key="s2_admin_manifest_id")
 
     conn = get_conn()
@@ -6029,12 +6076,14 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     stats = _s2_get_stats(mid)
 
     # ---- Estado del manifiesto (como en Admin Picking: métricas arriba) ----
-    st.subheader("Estado del manifiesto activo")
+    st.subheader("Estado del manifiesto")
     colA, colB, colC, colD = st.columns(4)
+    current_status_admin = next((str(m.get('status')) for m in work_manifests if int(m['id']) == int(mid)), 'STAGED')
     colA.metric("Manifiesto ID", mid)
     colB.metric("Ventas (Control)", stats.get("ventas", 0))
     colC.metric("Items", stats.get("items", 0))
     colD.metric("Etiquetas", stats.get("etiquetas", 0))
+    st.caption(f"Estado actual: {current_status_admin}")
 
     if f:
         control_name, labels_name, updated_at = f
