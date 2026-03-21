@@ -17,7 +17,6 @@ from contextlib import contextmanager
 DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
-S2_DEFAULT_BLOCK_MESAS = 3
 
 
 # =========================
@@ -3891,143 +3890,6 @@ def _s2_create_new_manifest() -> int:
     return mid
 
 
-def _s2_delete_manifest(mid: int):
-    """Delete one sorting lot completely and free its mesas."""
-    mid = int(mid)
-    conn = get_conn()
-    c = conn.cursor()
-    for t in [
-        's2_page_assign', 's2_pack_ship', 's2_labels', 's2_items',
-        's2_sales', 's2_files', 's2_dispatch', 's2_packing', 's2_manifests'
-    ]:
-        try:
-            c.execute(f"DELETE FROM {t} WHERE manifest_id=?;", (mid,))
-        except Exception:
-            pass
-    try:
-        c.execute("DELETE FROM s2_manifests WHERE id=?;", (mid,))
-    except Exception:
-        pass
-    conn.commit()
-    conn.close()
-
-
-def _s2_get_open_manifests():
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, status, created_at FROM s2_manifests WHERE status='ACTIVE' ORDER BY created_at, id;"
-    ).fetchall()
-    out = []
-    for idx, row in enumerate(rows, start=1):
-        mid = int(row[0])
-        stats = _s2_get_stats(mid)
-        mesas = [int(x[0]) for x in c.execute(
-            "SELECT DISTINCT mesa FROM s2_sales WHERE manifest_id=? AND mesa IS NOT NULL ORDER BY mesa;",
-            (mid,),
-        ).fetchall()]
-        frow = c.execute(
-            "SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?;",
-            (mid,),
-        ).fetchone()
-        out.append({
-            'idx': idx,
-            'mid': mid,
-            'status': str(row[1]),
-            'created_at': row[2],
-            'mesas': mesas,
-            'stats': stats,
-            'control_name': (frow[0] if frow else ''),
-            'labels_name': (frow[1] if frow else ''),
-            'updated_at': (frow[2] if frow else ''),
-        })
-    conn.close()
-    return out
-
-
-def _s2_get_taken_mesas(exclude_mid: int | None = None) -> list[int]:
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    sql = (
-        "SELECT DISTINCT s.mesa FROM s2_sales s "
-        "JOIN s2_manifests m ON m.id=s.manifest_id "
-        "WHERE m.status='ACTIVE' AND s.mesa IS NOT NULL"
-    )
-    params = []
-    if exclude_mid is not None:
-        sql += " AND s.manifest_id<>?"
-        params.append(int(exclude_mid))
-    sql += " ORDER BY s.mesa;"
-    rows = c.execute(sql, tuple(params)).fetchall()
-    conn.close()
-    return [int(r[0]) for r in rows if r and r[0] is not None]
-
-
-def _s2_default_block_size() -> int:
-    lots = _s2_get_open_manifests()
-    if lots:
-        last = lots[-1]
-        n = len(last.get('mesas') or [])
-        if n > 0:
-            return max(1, int(n))
-    return int(S2_DEFAULT_BLOCK_MESAS)
-
-
-def _s2_next_block_mesas(block_size: int | None = None, exclude_mid: int | None = None) -> list[int]:
-    size = max(1, int(block_size or _s2_default_block_size() or 1))
-    taken = _s2_get_taken_mesas(exclude_mid=exclude_mid)
-    start = (max(taken) + 1) if taken else 1
-    return list(range(start, start + size))
-
-
-def _s2_assign_pages_to_mesas(mid: int, mesas: list[int]) -> int:
-    pages = _s2_get_pages(mid)
-    if not pages or not mesas:
-        return 0
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (int(mid),))
-    for i, p in enumerate(pages):
-        mesa = int(mesas[i % len(mesas)])
-        c.execute(
-            """INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
-                     VALUES(?,?,?)
-                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""",
-            (int(mid), int(p), mesa),
-        )
-    conn.commit()
-    conn.close()
-    return len(pages)
-
-
-def _s2_mesas_text(mesas: list[int]) -> str:
-    vals = [int(x) for x in (mesas or [])]
-    if not vals:
-        return '-'
-    if len(vals) == 1:
-        return str(vals[0])
-    return f"{min(vals)} a {max(vals)}"
-
-
-def _s2_find_manifest_for_mesa(mesa: int):
-    mesa = int(mesa)
-    lots = _s2_get_open_manifests()
-    for lot in lots:
-        if mesa in (lot.get('mesas') or []):
-            return lot['mid']
-    return None
-
-
-def _s2_lot_label(mid: int) -> str:
-    lots = _s2_get_open_manifests()
-    for lot in lots:
-        if int(lot['mid']) == int(mid):
-            return f"Lote {lot['idx']}"
-    return "Lote"
-
-
 
 def _s2_zpl_underscore_decode(s: str) -> str:
     """
@@ -5015,17 +4877,30 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Sorting - Carga y Corridas")
 
-    mid = _s2_get_active_manifest_id()
-    st.session_state["sorting_manifest_id"] = mid
+    lots = _s2_get_open_manifests()
+    if lots:
+        rows = []
+        for lot in lots:
+            s = lot.get("stats", {}) or {}
+            rows.append({
+                "Lote": f"Lote {lot['idx']}",
+                "Mesas": _s2_mesas_text(lot.get("mesas") or []),
+                "Ventas": int(s.get("ventas", 0) or 0),
+                "Avance ventas": f"{int(s.get('sales_done', 0) or 0)}/{int(s.get('sales_total', 0) or 0)}",
+            })
+        with st.expander("Lotes abiertos", expanded=True):
+            st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    st.caption(f"Manifiesto activo: {mid}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ventas activas", sum(int((lot.get('stats') or {}).get('ventas', 0) or 0) for lot in lots))
+    c2.metric("Items", sum(int((lot.get('stats') or {}).get('items', 0) or 0) for lot in lots))
+    c3.metric("Etiquetas", sum(int((lot.get('stats') or {}).get('etiquetas', 0) or 0) for lot in lots))
+    c4.metric("Envíos únicos", sum(int((lot.get('stats') or {}).get('distinct_ship_labels', 0) or 0) for lot in lots))
+    st.caption(f"Mesas bloqueadas por lotes abiertos: {_s2_mesas_text(_s2_get_taken_mesas())}")
 
-    files_state = _s2_manifest_files_state(mid)
-    lock_control = bool(files_state.get("has_control"))
-    if lock_control:
-        st.warning("🔒 Ya hay un Control cargado en el manifiesto activo. Para cargar un manifiesto nuevo debes **Cerrar** o **Reiniciar** el Sorting desde Administrador.")
+    if st.session_state.get("s2_flash_upload"):
+        st.success(st.session_state.pop("s2_flash_upload"))
 
-    
     mode = st.radio(
         "Modo de carga",
         ["Uno (1 Control + 1 Etiquetas)", "Varios (lote: varios Controles + varias Etiquetas)"],
@@ -5036,165 +4911,63 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     if mode.startswith("Uno"):
         col1, col2 = st.columns(2)
         with col1:
-            pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf", disabled=lock_control)
+            pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf")
         with col2:
             zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
 
-        if pdf is not None:
-            # Limpia asignaciones de páginas previas (por si el manifiesto se reutiliza)
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
-            conn.commit()
-            conn.close()
-
+        st.caption("La carga no se procesa automáticamente. Sube ambos archivos y confirma.")
+        can_confirm = (pdf is not None and zpl is not None)
+        if st.button("Confirmar carga de Control + Etiquetas", disabled=not can_confirm, use_container_width=True):
+            mid = _s2_create_new_manifest()
             n_sales = _s2_upsert_control(mid, getattr(pdf, "name", "control.pdf"), pdf.getvalue())
-            st.success(f"Control cargado. Ventas detectadas: {n_sales}")
-            _s2_auto_assign_pages(mid, num_mesas=10)
-
-        if zpl is not None:
             n_labels = _s2_upsert_labels(mid, getattr(zpl, "name", "etiquetas.txt"), zpl.getvalue())
-            st.success(f"Etiquetas cargadas. IDs detectados: {n_labels}")
-
+            mesas = _s2_next_block_mesas()
+            _s2_assign_pages_to_mesas(mid, mesas)
+            created = _s2_create_corridas(mid)
+            st.session_state["sorting_manifest_id"] = mid
+            st.session_state["s2_flash_upload"] = (
+                f"{_s2_lot_label(mid)} creado correctamente. Mesas {_s2_mesas_text(mesas)} · "
+                f"Ventas: {int(n_sales or 0)} · Etiquetas: {int(n_labels or 0)} · Corridas: {int(created or 0)}"
+            )
+            for k in ["s2_control_pdf", "s2_labels_txt"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.rerun()
     else:
-        st.info("📦 Lote: se suman las páginas de todos los Controles (sin mezclar). Ej: 5 + 5 => 10 páginas para asignar a mesas.")
+        st.info("Sube varios pares Control + Etiquetas. Se crearán lotes separados y simultáneos, cada uno con sus propias mesas.")
         col1, col2 = st.columns(2)
         with col1:
             pdfs = st.file_uploader(
-                "Controles (PDF) — puedes subir varios",
-                type=["pdf"],
-                accept_multiple_files=True,
-                key="s2_control_pdfs",
-                disabled=lock_control,
+                "Controles (PDF)", type=["pdf"], accept_multiple_files=True, key="s2_control_pdfs"
             )
         with col2:
             zpls = st.file_uploader(
-                "Etiquetas (TXT/ZPL) — puedes subir varios",
-                type=["txt", "zpl"],
-                accept_multiple_files=True,
-                key="s2_labels_txts",
+                "Etiquetas (TXT/ZPL)", type=["txt", "zpl"], accept_multiple_files=True, key="s2_labels_txts"
             )
-
-        do_batch = st.button(
-            "Procesar lote en una sola tanda",
-            type="primary",
-            disabled=lock_control or (not pdfs and not zpls),
-            key="s2_do_batch",
-        )
-
-        if do_batch:
-            # Limpieza dura del manifiesto activo (solo datos del Sorting v2 del manifiesto)
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_labels WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_items WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
-            conn.commit()
-            conn.close()
-
-            # 1) Controles: append con offset de páginas
-            total_sales = 0
-            if pdfs:
-                offset = 0
-                names = []
-                for i, pdf in enumerate(pdfs):
-                    names.append(getattr(pdf, "name", f"control_{i+1}.pdf"))
-                    added = _s2_append_control(mid, names[-1], pdf.getvalue(), page_offset=offset)
-                    total_sales += int(added or 0)
-                    offset = _s2_get_max_page(mid)
-
-                # Guarda referencia del lote en s2_files (solo como registro)
-                try:
-                    first_pdf = pdfs[0].getvalue()
-                except Exception:
-                    first_pdf = None
-                conn = get_conn()
-                c = conn.cursor()
-                c.execute(
-                    """INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
-                         VALUES(?, ?, ?, ?)
-                         ON CONFLICT(manifest_id) DO UPDATE SET
-                            control_pdf=excluded.control_pdf,
-                            control_name=excluded.control_name,
-                            updated_at=excluded.updated_at;""",
-                    (mid, first_pdf, "LOTE: " + " + ".join(names), _s2_now_iso()),
-                )
-                conn.commit()
-                conn.close()
-
-                st.success(f"Controles procesados en lote. Ventas totales detectadas: {total_sales}")
-                _s2_auto_assign_pages(mid, num_mesas=10)
-
-            # 2) Etiquetas: concatenar y cargar 1 sola vez
-            if zpls:
-                parts = []
-                zpl_names = []
-                for i, z in enumerate(zpls):
-                    zpl_names.append(getattr(z, "name", f"etiquetas_{i+1}.txt"))
-                    try:
-                        parts.append(z.getvalue())
-                    except Exception:
-                        pass
-                labels_bytes = b"\n\n".join([p for p in parts if p])
-                n_labels = _s2_upsert_labels(mid, "LOTE: " + " + ".join(zpl_names), labels_bytes)
-                st.success(f"Etiquetas procesadas en lote. IDs detectados: {n_labels}")
-
-    # Resumen
-
-    # Resumen (para evitar confusión: ventas y etiquetas NO siempre coinciden 1:1)
-    stats = _s2_get_stats(mid)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Ventas (Control)", stats["ventas"])
-    c2.metric("Items (líneas)", stats["items"])
-    c3.metric("Etiquetas (total)", stats["etiquetas"])
-    c4.metric("Envíos únicos (labels)", stats["distinct_ship_labels"])
-
-    with st.expander("Ver detalle de conciliación", expanded=False):
-        st.write(
-            {
-                "Ventas con Pack ID": stats["ventas_with_pack"],
-                "Packs distintos (Control)": stats["distinct_packs"],
-                "Ventas con Envío (Control)": stats["ventas_with_ship"],
-                "Etiquetas con Pack ID": stats["labels_with_pack"],
-                "Etiquetas con Venta": stats["labels_with_sale"],
-                "Ventas matcheadas por Pack": stats["matched_by_pack"],
-                "Ventas sin Envío asignado": stats["missing_ship"],
-            }
-        )
-
-    pages = _s2_get_pages(mid)
-    if not pages:
-        st.info("Sube el Control.pdf para continuar.")
-        return
-
-    st.subheader("Asignación Página → Mesa")
-    assigns = dict(_s2_get_assignments(mid))
-    for p in pages:
-        cur = assigns.get(p, 1)
-        new_mesa = st.number_input(f"Página {p} → Mesa", min_value=1, max_value=50, value=int(cur), key=f"s2_mesa_{p}")
-        if int(new_mesa) != int(cur):
-            _s2_set_assignment(mid, p, int(new_mesa))
-
-    # Validate all pages assigned
-    assigns = dict(_s2_get_assignments(mid))
-    missing = [p for p in pages if p not in assigns]
-    if missing:
-        st.warning(f"Faltan páginas por asignar: {missing}")
-        if st.button("Auto-asignar faltantes", use_container_width=True):
-            _s2_auto_assign_pages(mid, num_mesas=10)
+        n_pdfs = len(pdfs or [])
+        n_zpls = len(zpls or [])
+        st.caption(f"Archivos listos: {n_pdfs} Control(es) y {n_zpls} Etiqueta(s). Se emparejan por orden.")
+        pairs = min(n_pdfs, n_zpls)
+        if n_pdfs != n_zpls and (n_pdfs or n_zpls):
+            st.warning("La cantidad de controles y etiquetas no coincide. Solo se procesarán los pares completos.")
+        if st.button("Procesar lote en una sola tanda", disabled=(pairs <= 0), use_container_width=True):
+            created_lots = []
+            for i in range(pairs):
+                mid = _s2_create_new_manifest()
+                pdf = pdfs[i]
+                zpl = zpls[i]
+                n_sales = _s2_upsert_control(mid, getattr(pdf, "name", f"control_{i+1}.pdf"), pdf.getvalue())
+                n_labels = _s2_upsert_labels(mid, getattr(zpl, "name", f"etiquetas_{i+1}.txt"), zpl.getvalue())
+                mesas = _s2_next_block_mesas()
+                _s2_assign_pages_to_mesas(mid, mesas)
+                created = _s2_create_corridas(mid)
+                created_lots.append(f"{_s2_lot_label(mid)} mesas {_s2_mesas_text(mesas)} ({int(created or 0)} corridas)")
+            st.session_state["s2_flash_upload"] = "Cargas creadas: " + " · ".join(created_lots)
+            for k in ["s2_control_pdfs", "s2_labels_txts"]:
+                if k in st.session_state:
+                    del st.session_state[k]
             st.rerun()
 
-    st.divider()
-    if st.button("✅ Crear corridas", use_container_width=True):
-        created = _s2_create_corridas(mid)
-        if created <= 0:
-            st.error("No se crearon corridas. Revisa asignación de páginas.")
-        else:
-            st.success(f"Corridas creadas/actualizadas: {created}")
-            st.session_state["s2_last_created"] = created
 
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
@@ -5474,30 +5247,40 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Administrador")
 
-    # Respaldo/Restauración SOLO SORTING (no afecta otros módulos)
     _render_module_backup_ui("sorting", "Sorting", SORTING_TABLES)
 
-    # Manifiesto activo
-    try:
-        mid = _s2_get_active_manifest_id()
-    except Exception:
-        mid = None
-
-    if not mid:
-        st.warning("No hay manifiesto activo. Primero carga Control + Etiquetas y crea corridas.")
+    lots = _s2_get_open_manifests()
+    if not lots:
+        st.warning("No hay lotes abiertos en Sorting.")
         return
+
+    rows = []
+    for lot in lots:
+        s = lot.get("stats", {}) or {}
+        rows.append({
+            "Lote": f"Lote {lot['idx']}",
+            "Mesas": _s2_mesas_text(lot.get("mesas") or []),
+            "Ventas": int(s.get("ventas", 0) or 0),
+            "Items": int(s.get("items", 0) or 0),
+            "Etiquetas": int(s.get("etiquetas", 0) or 0),
+            "Avance ventas": f"{int(s.get('sales_done', 0) or 0)}/{int(s.get('sales_total', 0) or 0)}",
+        })
+    st.subheader("Lotes abiertos")
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    labels = {f"Lote {lot['idx']} · Mesas {_s2_mesas_text(lot.get('mesas') or [])}": lot['mid'] for lot in lots}
+    pick = st.selectbox("Ver lote", list(labels.keys()), key="s2_admin_lot_pick")
+    mid = labels[pick]
+    st.session_state["sorting_manifest_id"] = mid
 
     conn = get_conn()
     c = conn.cursor()
-
-    # archivo/control info
     f = c.execute("SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
     stats = _s2_get_stats(mid)
 
-    # ---- Estado del manifiesto (como en Admin Picking: métricas arriba) ----
-    st.subheader("Estado del manifiesto activo")
+    st.subheader("Estado del lote")
     colA, colB, colC, colD = st.columns(4)
-    colA.metric("Manifiesto ID", mid)
+    colA.metric("Mesas", _s2_mesas_text([int(x[0]) for x in c.execute("SELECT DISTINCT mesa FROM s2_sales WHERE manifest_id=? AND mesa IS NOT NULL ORDER BY mesa;", (mid,)).fetchall()]))
     colB.metric("Ventas (Control)", stats.get("ventas", 0))
     colC.metric("Items", stats.get("items", 0))
     colD.metric("Etiquetas", stats.get("etiquetas", 0))
@@ -5506,19 +5289,14 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         control_name, labels_name, updated_at = f
         st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
     else:
-        st.caption("Aún no se han cargado archivos para este manifiesto.")
+        st.caption("Aún no se han cargado archivos para este lote.")
 
-    # ---- Trazabilidad ----
     st.divider()
     st.subheader("Trazabilidad")
-
     rows = c.execute(
-        "SELECT mesa, COUNT(*) as ventas, "
-        "SUM(CASE WHEN status='DONE' THEN 1 ELSE 0 END) as done "
-        "FROM s2_sales WHERE manifest_id=? GROUP BY mesa ORDER BY mesa;",
+        "SELECT mesa, COUNT(*) as ventas, SUM(CASE WHEN status='DONE' THEN 1 ELSE 0 END) as done FROM s2_sales WHERE manifest_id=? GROUP BY mesa ORDER BY mesa;",
         (mid,)
     ).fetchall()
-
     if rows:
         mesa_data = []
         for mesa, ventas, done in rows:
@@ -5534,10 +5312,8 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     else:
         st.info("No hay ventas asignadas a mesas todavía.")
 
-    # ---- Incidencias (bajo trazabilidad) ----
     st.divider()
     st.subheader("Incidencias")
-
     inc_rows = c.execute(
         """SELECT s.sale_id, s.mesa, s.shipment_id,
                   i.sku, i.description, i.qty, i.picked, i.status,
@@ -5551,16 +5327,11 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
             ORDER BY s.mesa, s.page_no, s.row_no, s.sale_id, i.sku;""",
         (mid,),
     ).fetchall()
-
     if inc_rows:
         df_inc = pd.DataFrame(
             inc_rows,
-            columns=[
-                "Venta", "Mesa", "Envío", "SKU", "Descripción Control",
-                "Solicitado", "Verificado", "Estado", "Modo", "Hora"
-            ],
+            columns=["Venta", "Mesa", "Envío", "SKU", "Descripción Control", "Solicitado", "Verificado", "Estado", "Modo", "Hora"],
         )
-
         def _title_tec_for_sku(sku_val, fallback_desc=""):
             try:
                 if isinstance(inv_map_sku, dict):
@@ -5571,44 +5342,29 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
             except Exception:
                 pass
             return str(fallback_desc or sku_val or "")
-
         try:
-            df_inc["Producto (técnico)"] = df_inc.apply(
-                lambda r: _title_tec_for_sku(r["SKU"], r["Descripción Control"]),
-                axis=1,
-            )
+            df_inc["Producto (técnico)"] = df_inc.apply(lambda r: _title_tec_for_sku(r["SKU"], r["Descripción Control"]), axis=1)
         except Exception:
             df_inc["Producto (técnico)"] = df_inc["SKU"].astype(str)
-
-        # Orden similar a Admin Picking
         try:
-            df_inc = df_inc[[
-                "Mesa", "Venta", "Envío", "SKU", "Producto (técnico)",
-                "Solicitado", "Verificado", "Estado", "Modo", "Hora"
-            ]]
+            df_inc = df_inc[["Mesa", "Venta", "Envío", "SKU", "Producto (técnico)", "Solicitado", "Verificado", "Estado", "Modo", "Hora"]]
         except Exception:
             pass
-
         st.dataframe(df_inc, use_container_width=True, hide_index=True)
     else:
-        st.info("Sin incidencias ni productos marcados como Sin EAN en este manifiesto.")
+        st.info("Sin incidencias ni productos marcados como Sin EAN en este lote.")
 
-    # ---- Ventas pendientes ----
     st.divider()
     st.subheader("Ventas pendientes")
-
     pend = c.execute(
-        "SELECT sale_id, mesa, shipment_id, status FROM s2_sales "
-        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, row_no, sale_id LIMIT 200;",
+        "SELECT sale_id, mesa, shipment_id, status FROM s2_sales WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, row_no, sale_id LIMIT 200;",
         (mid,),
     ).fetchall()
-
     if pend:
         pend_data = []
         for sale_id, mesa, shipment_id, status in pend:
             it = c.execute(
-                "SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) "
-                "FROM s2_items WHERE manifest_id=? AND sale_id=?;",
+                "SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) FROM s2_items WHERE manifest_id=? AND sale_id=?;",
                 (mid, sale_id),
             ).fetchone()
             total = int(it[0] or 0)
@@ -5624,7 +5380,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     else:
         st.success("No hay ventas pendientes: todo está cerrado.")
 
-    # ---- Conciliación ----
     with st.expander("Conciliación ventas ↔ etiquetas", expanded=False):
         st.write({
             "Envíos únicos (labels)": stats.get("distinct_ship_labels"),
@@ -5636,56 +5391,39 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
             "Ventas sin Envío asignado": stats.get("missing_ship"),
         })
 
-        missing = c.execute(
-            "SELECT sale_id, page_no, pack_id FROM s2_sales "
-            "WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') "
-            "ORDER BY page_no, row_no, sale_id LIMIT 20",
-            (mid,),
-        ).fetchall()
-        if missing:
-            st.warning("Ejemplos de ventas sin envío asignado (primeras 20):")
-            st.table([{"venta": a, "pagina": b, "pack_id": cpid or ""} for (a, b, cpid) in missing])
-
-    # ---- Acciones (bloqueo duro + cierre + reinicio) ----
     st.divider()
     st.subheader("Acciones")
-    st.caption("🔒 Bloqueo duro: para cargar un nuevo manifiesto debes **Cerrar** o **Reiniciar** el manifiesto activo.")
-
     close_ok = (
         int(stats.get("sales_total", 0) or 0) > 0
         and int(stats.get("sales_pending", 0) or 0) == 0
         and int(stats.get("items_pending", 0) or 0) == 0
     )
-    btn_close = st.button("✅ Cerrar manifiesto (habilitar nuevo)", disabled=not close_ok)
-    if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
-        st.info(
-            "Para cerrar el manifiesto: todas las **ventas** deben estar cerradas y no deben quedar **ítems pendientes**. "
-            "Si necesitas cargar otro manifiesto sin terminar, usa **Reiniciar** (borra todo)."
-        )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅ Cerrar lote", disabled=not close_ok, use_container_width=True):
+            _s2_close_manifest(mid)
+            st.success(f"{_s2_lot_label(mid)} cerrado correctamente.")
+            st.rerun()
+        if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
+            st.info("Para cerrar el lote: todas las ventas deben estar cerradas y no deben quedar ítems pendientes.")
+    with c2:
+        if f"s2_delete_arm_{mid}" not in st.session_state:
+            st.session_state[f"s2_delete_arm_{mid}"] = False
+        arm = st.checkbox("Quiero eliminar este lote", key=f"s2_delete_arm_{mid}")
+        confirm_txt = st.text_input("Escribe BORRAR para confirmar", key=f"s2_delete_txt_{mid}", disabled=not arm)
+        if st.button("🗑️ Eliminar lote", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"), use_container_width=True):
+            lot_label = _s2_lot_label(mid)
+            _s2_delete_manifest(mid)
+            st.success(f"{lot_label} eliminado correctamente.")
+            st.rerun()
 
-    if btn_close:
-        _s2_close_manifest(mid)
-        new_mid = _s2_create_new_manifest()
-        for k in list(st.session_state.keys()):
-            if k.startswith("s2_") or "sorting" in k:
-                del st.session_state[k]
-        st.success(f"Manifiesto {mid} cerrado. Nuevo manifiesto activo: {new_mid}")
-        st.rerun()
-
-    # Reinicio al final (como en Admin Picking)
+    st.divider()
     if "s2_reset_armed" not in st.session_state:
         st.session_state["s2_reset_armed"] = False
-
-    arm = st.checkbox("Quiero reiniciar Sorting (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
+    arm = st.checkbox("Quiero reiniciar Sorting completo (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
     st.session_state["s2_reset_armed"] = bool(arm)
-
-    confirm_txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm)
-    do_reset = st.button(
-        "🗑️ Reiniciar Sorting (borrar todo)",
-        type="primary",
-        disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"),
-    )
-
+    confirm_txt = st.text_input("Escribe BORRAR TODO para confirmar", value="", disabled=not arm)
+    do_reset = st.button("🗑️ Reiniciar Sorting (borrar todo)", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR TODO"))
     if do_reset:
         _s2_reset_all_sorting()
         for k in list(st.session_state.keys()):
@@ -5695,6 +5433,7 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         st.rerun()
 
     conn.close()
+
 
 # =========================
 # CONTADOR DE PAQUETES (Flex/Colecta)
