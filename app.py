@@ -5328,6 +5328,103 @@ def _s2_build_assignment_preview(pages: list[int], start_mesa: int = 1, mesas_co
     return preview
 
 
+def _s2_set_page_assignments(mid: int, page_to_mesa: dict[int, int]):
+    clean = {}
+    for p, m in (page_to_mesa or {}).items():
+        try:
+            clean[int(p)] = int(m)
+        except Exception:
+            continue
+    if not clean:
+        return 0
+    conn = get_conn()
+    c = conn.cursor()
+    for page_no, mesa in sorted(clean.items()):
+        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
+                     VALUES(?,?,?)
+                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (int(mid), int(page_no), int(mesa)))
+    conn.commit()
+    conn.close()
+    return len(clean)
+
+
+def _s2_validate_page_assignment_map(page_to_mesa: dict[int, int], locked_mesas: list[int] | None = None):
+    locked = {int(x) for x in (locked_mesas or [])}
+    clean = {}
+    errors = []
+    mesa_to_pages: dict[int, list[int]] = {}
+    for p, m in (page_to_mesa or {}).items():
+        try:
+            page_no = int(p)
+            mesa = int(m)
+        except Exception:
+            errors.append(f"Asignación inválida en página {p}.")
+            continue
+        if mesa <= 0:
+            errors.append(f"La página {page_no} tiene una mesa inválida.")
+            continue
+        if mesa in locked:
+            errors.append(f"La mesa {mesa} está bloqueada por otro lote activo.")
+        clean[page_no] = mesa
+        mesa_to_pages.setdefault(mesa, []).append(page_no)
+    duplicated = {mesa: sorted(pages) for mesa, pages in mesa_to_pages.items() if len(pages) > 1}
+    if duplicated:
+        for mesa, pages in duplicated.items():
+            errors.append(f"La mesa {mesa} está repetida en las páginas {', '.join(map(str, pages))}. Debe quedar 1 página por mesa.")
+    return len(errors) == 0, clean, errors
+
+
+def _s2_release_mesa_if_completed(mid: int, mesa: int):
+    conn = get_conn()
+    c = conn.cursor()
+    pending = int(c.execute("""SELECT COUNT(*)
+                               FROM s2_sales
+                               WHERE manifest_id=? AND mesa=? AND status!='DONE';""", (int(mid), int(mesa))).fetchone()[0] or 0)
+    released = False
+    if pending == 0:
+        c.execute("DELETE FROM s2_page_assign WHERE manifest_id=? AND mesa=?;", (int(mid), int(mesa)))
+        released = (c.rowcount or 0) > 0
+    conn.commit()
+    conn.close()
+    return released
+
+
+def _s2_render_page_assignment_editor(editor_key: str, pages: list[int], suggested_start: int, locked_mesas: list[int] | None = None):
+    pages = sorted({int(p) for p in (pages or [])})
+    locked = sorted({int(x) for x in (locked_mesas or []) if x is not None})
+    if not pages:
+        st.info("No se detectaron páginas para asignar.")
+        return {}, False
+
+    st.markdown("**Asignación manual página → mesa**")
+    st.caption("Debes elegir la mesa de cada página. Se exige 1 página por mesa y no se pueden usar mesas bloqueadas.")
+    if locked:
+        st.caption(f"Mesas bloqueadas ahora: {', '.join(map(str, locked))}")
+
+    mapping = {}
+    default_start = max(1, int(suggested_start or 1))
+    for idx, page_no in enumerate(pages):
+        default_mesa = default_start + idx
+        mesa_val = st.number_input(
+            f"Página {page_no} → Mesa",
+            min_value=1,
+            max_value=200,
+            value=int(default_mesa),
+            step=1,
+            key=f"{editor_key}_page_{page_no}",
+        )
+        mapping[int(page_no)] = int(mesa_val)
+
+    ok, clean, errors = _s2_validate_page_assignment_map(mapping, locked_mesas=locked)
+    preview_rows = [{"Página": int(p), "Mesa": int(m)} for p, m in sorted(clean.items())]
+    if preview_rows:
+        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+    if not ok:
+        for err in errors:
+            st.error(err)
+    return clean, ok
+
+
 def _s2_append_labels(mid: int, labels_name: str, labels_bytes: bytes):
     pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
     try:
@@ -5602,15 +5699,16 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         with col2:
             zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
 
-        st.caption("Al confirmar, la carga entra directo a producción, se le asignan mesas al instante y queda lista para camarero.")
+        st.caption("Al confirmar, la carga entra directo a producción y queda lista para camarero, pero ahora eliges manualmente la mesa de cada página.")
 
+        single_assignment_map = {}
+        single_assignment_ok = False
         if pdf is not None or zpl is not None:
-            next_start_preview, mesa_block_preview = _s2_next_global_mesa_block(default_count=3)
+            next_start_preview, _mesa_block_preview = _s2_next_global_mesa_block(default_count=1)
             with st.container(border=True):
                 st.markdown("**Resumen de la carga lista para confirmar**")
                 st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
                 st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
-                st.caption(f"Este nuevo lote usará **{_s2_mesas_text_from_list(list(range(next_start_preview, next_start_preview + mesa_block_preview)))}**.")
                 if pdf is not None:
                     try:
                         parsed_preview = _s2_parse_control_pdf(pdf.getvalue())
@@ -5619,15 +5717,21 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                         preview_pages = []
                     if preview_pages:
                         st.write(f"**Páginas detectadas en el Control:** {len(preview_pages)}")
-                        preview_rows = _s2_build_assignment_preview(preview_pages, start_mesa=next_start_preview, mesas_count=mesa_block_preview)
-                        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+                        single_assignment_map, single_assignment_ok = _s2_render_page_assignment_editor(
+                            "s2_single_assign",
+                            preview_pages,
+                            suggested_start=next_start_preview,
+                            locked_mesas=locked_mesas_all,
+                        )
                     else:
                         st.info("No pude previsualizar las páginas del Control antes de confirmar, pero la carga igual se podrá procesar.")
+                else:
+                    st.info("Sube el Control para poder definir la asignación manual de páginas a mesas.")
 
         process_one = st.button(
             "Confirmar carga de Control + Etiquetas",
             type="primary",
-            disabled=(pdf is None and zpl is None),
+            disabled=(pdf is None or zpl is None or not single_assignment_ok),
             key="s2_process_single_upload",
         )
 
@@ -5643,10 +5747,17 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 zpl_bytes = zpl.getvalue()
 
                 target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
-                next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
                 n_sales = _s2_upsert_control(target_mid, pdf_name, pdf_bytes)
                 pages_target = _s2_get_pages(target_mid)
-                _s2_auto_assign_specific_pages(target_mid, pages_target, start_mesa=next_start, mesas_count=mesa_block)
+                valid_assign, page_to_mesa, assign_errors = _s2_validate_page_assignment_map(single_assignment_map, locked_mesas=locked_mesas_all)
+                if sorted(page_to_mesa.keys()) != sorted({int(p) for p in pages_target}):
+                    valid_assign = False
+                    assign_errors.append("La asignación manual ya no coincide con las páginas detectadas del Control.")
+                if not valid_assign:
+                    for err in assign_errors:
+                        st.error(err)
+                    return
+                _s2_set_page_assignments(target_mid, page_to_mesa)
                 n_labels = _s2_upsert_labels(target_mid, zpl_name, zpl_bytes)
                 created = _s2_create_corridas(target_mid)
 
@@ -5660,7 +5771,7 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 st.rerun()
 
     else:
-        st.info("📦 Lote: se crea un lote nuevo, se cargan todos los Controles y Etiquetas y se manda directo a producción con mesas exclusivas.")
+        st.info("📦 Lote: se crea un lote nuevo, se cargan todos los Controles y Etiquetas y tú defines manualmente la mesa de cada página. Las mesas ya activas siguen bloqueadas hasta que el camarero cierre esa mesa.")
         col1, col2 = st.columns(2)
         with col1:
             pdfs = st.file_uploader(
@@ -5677,10 +5788,36 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 key="s2_labels_txts",
             )
 
+        batch_assignment_map = {}
+        batch_assignment_ok = False
+        if pdfs:
+            try:
+                preview_pages_batch = []
+                offset_preview = 0
+                for i, pdf_obj in enumerate(pdfs):
+                    parsed_preview = _s2_parse_control_pdf(pdf_obj.getvalue())
+                    raw_pages = sorted({int(r.get("page_no") or 1) for r in parsed_preview})
+                    for p in raw_pages:
+                        preview_pages_batch.append(int(p + offset_preview))
+                    if raw_pages:
+                        offset_preview = max(preview_pages_batch)
+                if preview_pages_batch:
+                    with st.container(border=True):
+                        st.markdown("**Asignación manual consolidada del lote**")
+                        batch_assignment_map, batch_assignment_ok = _s2_render_page_assignment_editor(
+                            "s2_batch_assign",
+                            sorted(set(preview_pages_batch)),
+                            suggested_start=_s2_next_global_mesa_block(default_count=1)[0],
+                            locked_mesas=locked_mesas_all,
+                        )
+            except Exception:
+                batch_assignment_map = {}
+                batch_assignment_ok = False
+
         do_batch = st.button(
             "Procesar lote en una sola tanda",
             type="primary",
-            disabled=(not pdfs and not zpls),
+            disabled=(not pdfs or not zpls or not batch_assignment_ok),
             key="s2_do_batch",
         )
 
@@ -5691,7 +5828,6 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 st.error("Debes subir al menos un archivo de Etiquetas (TXT/ZPL).")
             else:
                 target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
-                next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
                 total_sales = 0
                 offset = 0
                 control_names = []
@@ -5704,7 +5840,15 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                         offset = _s2_get_max_page(target_mid)
                         total_sales += int(_s2_append_control(target_mid, name, pdf.getvalue(), page_offset=offset) or 0)
                 pages_target = _s2_get_pages(target_mid)
-                _s2_auto_assign_specific_pages(target_mid, pages_target, start_mesa=next_start, mesas_count=mesa_block)
+                valid_assign, page_to_mesa, assign_errors = _s2_validate_page_assignment_map(batch_assignment_map, locked_mesas=locked_mesas_all)
+                if sorted(page_to_mesa.keys()) != sorted({int(p) for p in pages_target}):
+                    valid_assign = False
+                    assign_errors.append("La asignación manual ya no coincide con las páginas finales del lote.")
+                if not valid_assign:
+                    for err in assign_errors:
+                        st.error(err)
+                    return
+                _s2_set_page_assignments(target_mid, page_to_mesa)
 
                 total_labels = 0
                 label_names = []
@@ -6051,10 +6195,13 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         with c2:
             if st.button("✅ Cerrar venta y volver a escanear etiqueta", key=f"s2_close_{sale_id}", use_container_width=True, disabled=not confirm_close):
                 _s2_close_sale(mid, sale_id)
+                mesa_released = _s2_release_mesa_if_completed(mid, int(mesa_db or mesa or 0)) if int(mesa_db or mesa or 0) > 0 else False
                 st.session_state["s2_sale_open"] = None
                 st.session_state["s2_sale_open_manifest_id"] = None
                 st.session_state["s2_clear_prod_scan"] = True
                 st.session_state["s2_clear_label_scan"] = True
+                if mesa_released:
+                    st.session_state["s2_upload_flash"] = f"Mesa {int(mesa_db or mesa)} liberada para reutilizarse." 
                 st.rerun()
     else:
         st.info("Para cerrar: completa todos los productos o márcalos como Incidencia / Sin EAN.")
