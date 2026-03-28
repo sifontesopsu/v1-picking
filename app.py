@@ -4136,6 +4136,13 @@ def _s2_create_tables():
         mesa INTEGER NOT NULL,
         PRIMARY KEY (manifest_id, page_no)
     );""")
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_mesa_status (
+        manifest_id INTEGER NOT NULL,
+        mesa INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        closed_at TEXT,
+        PRIMARY KEY (manifest_id, mesa)
+    );""")
     c.execute("""CREATE TABLE IF NOT EXISTS s2_sales (
         manifest_id INTEGER NOT NULL,
         sale_id TEXT NOT NULL,
@@ -4193,6 +4200,16 @@ def _s2_create_tables():
     except Exception:
         pass
 
+
+    # s2_mesa_status: compatibilidad / migración suave
+    try:
+        cols_ms = [r[1] for r in c.execute("PRAGMA table_info(s2_mesa_status);").fetchall()]
+        if "status" not in cols_ms:
+            c.execute("ALTER TABLE s2_mesa_status ADD COLUMN status TEXT NOT NULL DEFAULT 'OPEN';")
+        if "closed_at" not in cols_ms:
+            c.execute("ALTER TABLE s2_mesa_status ADD COLUMN closed_at TEXT;")
+    except Exception:
+        pass
 
     # Mapa Pack ID -> Shipment ID (necesario para Colecta)
     c.execute("""CREATE TABLE IF NOT EXISTS s2_pack_ship (
@@ -4319,21 +4336,20 @@ def _s2_get_locked_mesas(exclude_mid: int | None = None):
     _s2_create_tables()
     conn = get_conn()
     c = conn.cursor()
-    if exclude_mid is None:
-        rows = c.execute("""SELECT DISTINCT p.mesa
-                            FROM s2_page_assign p
-                            JOIN s2_manifests m ON m.id = p.manifest_id
-                            WHERE m.status='ACTIVE'
-                            ORDER BY p.mesa;""").fetchall()
-    else:
-        rows = c.execute("""SELECT DISTINCT p.mesa
-                            FROM s2_page_assign p
-                            JOIN s2_manifests m ON m.id = p.manifest_id
-                            WHERE m.status='ACTIVE' AND p.manifest_id<>?
-                            ORDER BY p.mesa;""", (int(exclude_mid),)).fetchall()
+    params = []
+    where_ex = ""
+    if exclude_mid is not None:
+        where_ex = " AND p.manifest_id<>?"
+        params.append(int(exclude_mid))
+    rows = c.execute(f"""SELECT DISTINCT p.mesa
+                        FROM s2_page_assign p
+                        JOIN s2_manifests m ON m.id = p.manifest_id
+                        LEFT JOIN s2_mesa_status ms ON ms.manifest_id = p.manifest_id AND ms.mesa = p.mesa
+                        WHERE m.status='ACTIVE'
+                          AND COALESCE(ms.status, 'OPEN')='OPEN'{where_ex}
+                        ORDER BY p.mesa;""", tuple(params)).fetchall()
     conn.close()
     return [int(r[0]) for r in rows if r[0] is not None]
-
 
 def _s2_next_global_mesa_block(default_count: int = 3, exclude_mid: int | None = None):
     locked = _s2_get_locked_mesas(exclude_mid=exclude_mid)
@@ -4349,26 +4365,20 @@ def _s2_find_manifest_by_mesa(mesa: int):
     row = c.execute("""SELECT p.manifest_id
                        FROM s2_page_assign p
                        JOIN s2_manifests m ON m.id = p.manifest_id
-                       WHERE m.status='ACTIVE' AND p.mesa=?
+                       LEFT JOIN s2_mesa_status ms ON ms.manifest_id = p.manifest_id AND ms.mesa = p.mesa
+                       WHERE m.status='ACTIVE' AND p.mesa=? AND COALESCE(ms.status, 'OPEN')='OPEN'
                        ORDER BY p.manifest_id DESC
                        LIMIT 1;""", (int(mesa),)).fetchone()
     conn.close()
     return int(row[0]) if row else None
 
-
 def _s2_delete_manifest(mid: int):
     _s2_create_tables()
-    _s2_pack_dispatch_create_tables()
     conn = get_conn()
     c = conn.cursor()
     mid = int(mid)
-
-    # Borrado robusto: algunas instalaciones antiguas pueden no tener todas
-    # las tablas auxiliares creadas todavía al momento de eliminar un lote.
-    existing = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
     for tbl in ['s2_dispatch', 's2_pack_ship', 's2_packing', 's2_labels', 's2_items', 's2_sales', 's2_page_assign', 's2_files']:
-        if tbl in existing:
-            c.execute(f"DELETE FROM {tbl} WHERE manifest_id=?;", (mid,))
+        c.execute(f"DELETE FROM {tbl} WHERE manifest_id=?;", (mid,))
     c.execute("DELETE FROM s2_manifests WHERE id=?;", (mid,))
     conn.commit()
     conn.close()
@@ -5334,6 +5344,130 @@ def _s2_build_assignment_preview(pages: list[int], start_mesa: int = 1, mesas_co
     return preview
 
 
+def _s2_build_default_page_assignment(pages: list[int], exclude_mid: int | None = None):
+    pages = sorted({int(p) for p in (pages or [])})
+    locked = set(_s2_get_locked_mesas(exclude_mid=exclude_mid))
+    used = set()
+    current = 1
+    mapping = {}
+    for p in pages:
+        while current in locked or current in used:
+            current += 1
+        mapping[int(p)] = int(current)
+        used.add(int(current))
+        current += 1
+    return mapping
+
+
+def _s2_render_assignment_editor(pages: list[int], widget_prefix: str, exclude_mid: int | None = None):
+    pages = sorted({int(p) for p in (pages or [])})
+    locked = set(_s2_get_locked_mesas(exclude_mid=exclude_mid))
+    defaults = _s2_build_default_page_assignment(pages, exclude_mid=exclude_mid)
+
+    assignments = {}
+    warnings = []
+    if not pages:
+        return assignments, warnings, locked
+
+    st.markdown("**Asignación manual Página → Mesa**")
+    st.caption("Define exactamente qué página irá a qué mesa. Las mesas bloqueadas por trabajo activo no se pueden reutilizar.")
+
+    seen_mesas = {}
+    for p in pages:
+        key = f"{widget_prefix}_page_{int(p)}"
+        default_mesa = int(st.session_state.get(key, defaults.get(int(p), 1)))
+        mesa = st.number_input(
+            f"Página {int(p)} → Mesa",
+            min_value=1,
+            max_value=200,
+            value=default_mesa,
+            step=1,
+            key=key,
+        )
+        mesa = int(mesa)
+        assignments[int(p)] = mesa
+
+        if mesa in locked:
+            warnings.append(f"La mesa {mesa} está bloqueada por un lote activo.")
+        if mesa in seen_mesas:
+            warnings.append(f"La mesa {mesa} está repetida en las páginas {seen_mesas[mesa]} y {int(p)}.")
+        else:
+            seen_mesas[mesa] = int(p)
+
+    return assignments, warnings, locked
+
+
+def _s2_apply_page_assignments(mid: int, page_to_mesa: dict[int, int]):
+    page_to_mesa = {int(p): int(m) for p, m in (page_to_mesa or {}).items()}
+    if not page_to_mesa:
+        return 0
+    conn = get_conn()
+    c = conn.cursor()
+    for p, mesa in sorted(page_to_mesa.items()):
+        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
+                     VALUES(?,?,?)
+                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (int(mid), int(p), int(mesa)))
+    conn.commit()
+    conn.close()
+    return len(page_to_mesa)
+
+
+def _s2_preview_batch_pages(pdfs):
+    preview_pages = []
+    running_offset = 0
+    for pdf in (pdfs or []):
+        try:
+            parsed = _s2_parse_control_pdf(pdf.getvalue())
+            pages_local = sorted({int(r.get("page_no") or 1) for r in parsed})
+        except Exception:
+            pages_local = []
+        for p in pages_local:
+            preview_pages.append(int(p) + int(running_offset))
+        if pages_local:
+            running_offset += max(pages_local)
+    return sorted({int(p) for p in preview_pages})
+
+
+def _s2_close_mesa(mid: int, mesa: int):
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    pending = int(c.execute("""SELECT COUNT(*)
+                               FROM s2_sales
+                               WHERE manifest_id=? AND mesa=? AND status!='DONE';""", (int(mid), int(mesa))).fetchone()[0] or 0)
+    if pending > 0:
+        conn.close()
+        return False, f"La mesa {int(mesa)} todavía tiene {pending} venta(s) pendiente(s)."
+
+    c.execute("""INSERT INTO s2_mesa_status(manifest_id, mesa, status, closed_at)
+                 VALUES(?,?, 'CLOSED', ?)
+                 ON CONFLICT(manifest_id, mesa) DO UPDATE SET
+                    status='CLOSED',
+                    closed_at=excluded.closed_at;""", (int(mid), int(mesa), _s2_now_iso()))
+
+    open_rows = c.execute("""SELECT DISTINCT p.mesa
+                             FROM s2_page_assign p
+                             LEFT JOIN s2_mesa_status ms ON ms.manifest_id = p.manifest_id AND ms.mesa = p.mesa
+                             WHERE p.manifest_id=? AND COALESCE(ms.status, 'OPEN')='OPEN';""", (int(mid),)).fetchall()
+    if not open_rows:
+        c.execute("UPDATE s2_manifests SET status='DONE' WHERE id=?;", (int(mid),))
+
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def _s2_is_mesa_closed(mid: int, mesa: int) -> bool:
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute("""SELECT status
+                       FROM s2_mesa_status
+                       WHERE manifest_id=? AND mesa=?;""", (int(mid), int(mesa))).fetchone()
+    conn.close()
+    return bool(row and str(row[0]).upper() == 'CLOSED')
+
+
 def _s2_append_labels(mid: int, labels_name: str, labels_bytes: bytes):
     pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
     try:
@@ -5462,6 +5596,15 @@ def _s2_create_corridas(mid:int):
     c=conn.cursor()
     c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=?;", (mid,))
     page_to_mesa = {int(p): int(m) for p,m in c.fetchall()}
+
+    mesas_assigned = sorted({int(m) for m in page_to_mesa.values() if m is not None})
+    for mesa in mesas_assigned:
+        c.execute("""INSERT INTO s2_mesa_status(manifest_id, mesa, status, closed_at)
+                     VALUES(?,?, 'OPEN', NULL)
+                     ON CONFLICT(manifest_id, mesa) DO UPDATE SET
+                        status='OPEN',
+                        closed_at=NULL;""", (int(mid), int(mesa)))
+
     # update sales
     c.execute("SELECT sale_id, page_no FROM s2_sales WHERE manifest_id=?;", (mid,))
     sales = c.fetchall()
@@ -5478,8 +5621,6 @@ def _s2_create_corridas(mid:int):
     conn.commit()
     conn.close()
     return updated
-
-
 
 def _s2_next_pending_sale_in_sequence(mid:int, mesa:int):
     """Devuelve la próxima venta pendiente (secuencia obligatoria) para una mesa,
@@ -5592,7 +5733,7 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         st.info("No hay lotes activos todavía. Carga el primer Control + Etiquetas para comenzar.")
 
     if locked_mesas_all:
-        st.caption(f"Mesas bloqueadas por lotes activos: {', '.join(map(str, locked_mesas_all))}")
+        st.caption(f"Mesas bloqueadas por lotes activos abiertos: {', '.join(map(str, locked_mesas_all))}")
 
     mode = st.radio(
         "Modo de carga",
@@ -5608,27 +5749,41 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         with col2:
             zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
 
-        st.caption("Al confirmar, la carga entra directo a producción, se le asignan mesas al instante y queda lista para camarero.")
+        st.caption("Al confirmar, la carga entra directo a producción, pero ahora tú eliges exactamente qué página va a cada mesa.")
+
+        single_preview_pages = []
+        single_assignments = {}
+        single_warnings = []
+        if pdf is not None:
+            try:
+                parsed_preview = _s2_parse_control_pdf(pdf.getvalue())
+                single_preview_pages = sorted({int(r.get("page_no") or 1) for r in parsed_preview})
+            except Exception:
+                single_preview_pages = []
 
         if pdf is not None or zpl is not None:
-            next_start_preview, mesa_block_preview = _s2_next_global_mesa_block(default_count=3)
             with st.container(border=True):
                 st.markdown("**Resumen de la carga lista para confirmar**")
                 st.write(f"**Control:** {getattr(pdf, 'name', '-') if pdf is not None else '-'}")
                 st.write(f"**Etiquetas:** {getattr(zpl, 'name', '-') if zpl is not None else '-'}")
-                st.caption(f"Este nuevo lote usará **{_s2_mesas_text_from_list(list(range(next_start_preview, next_start_preview + mesa_block_preview)))}**.")
-                if pdf is not None:
-                    try:
-                        parsed_preview = _s2_parse_control_pdf(pdf.getvalue())
-                        preview_pages = sorted({int(r.get("page_no") or 1) for r in parsed_preview})
-                    except Exception:
-                        preview_pages = []
-                    if preview_pages:
-                        st.write(f"**Páginas detectadas en el Control:** {len(preview_pages)}")
-                        preview_rows = _s2_build_assignment_preview(preview_pages, start_mesa=next_start_preview, mesas_count=mesa_block_preview)
-                        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No pude previsualizar las páginas del Control antes de confirmar, pero la carga igual se podrá procesar.")
+
+                if single_preview_pages:
+                    st.write(f"**Páginas detectadas en el Control:** {len(single_preview_pages)}")
+                    single_assignments, single_warnings, _ = _s2_render_assignment_editor(
+                        single_preview_pages,
+                        widget_prefix="s2_single_assign",
+                    )
+                    st.dataframe(
+                        [{"Página": int(p), "Mesa": int(m)} for p, m in sorted(single_assignments.items())],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No pude previsualizar las páginas del Control antes de confirmar.")
+
+                if single_warnings:
+                    for msg in single_warnings:
+                        st.warning(msg)
 
         process_one = st.button(
             "Confirmar carga de Control + Etiquetas",
@@ -5642,6 +5797,10 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 st.error("Debes subir el Control (PDF) antes de confirmar la carga.")
             elif zpl is None:
                 st.error("Debes subir también las Etiquetas (TXT/ZPL) antes de confirmar la carga.")
+            elif not single_preview_pages:
+                st.error("No pude detectar páginas del Control para asignarlas manualmente.")
+            elif single_warnings:
+                st.error("Corrige la asignación Página → Mesa antes de confirmar.")
             else:
                 pdf_name = getattr(pdf, "name", "control.pdf")
                 pdf_bytes = pdf.getvalue()
@@ -5649,10 +5808,8 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 zpl_bytes = zpl.getvalue()
 
                 target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
-                next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
                 n_sales = _s2_upsert_control(target_mid, pdf_name, pdf_bytes)
-                pages_target = _s2_get_pages(target_mid)
-                _s2_auto_assign_specific_pages(target_mid, pages_target, start_mesa=next_start, mesas_count=mesa_block)
+                _s2_apply_page_assignments(target_mid, single_assignments)
                 n_labels = _s2_upsert_labels(target_mid, zpl_name, zpl_bytes)
                 created = _s2_create_corridas(target_mid)
 
@@ -5666,7 +5823,7 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 st.rerun()
 
     else:
-        st.info("📦 Lote: se crea un lote nuevo, se cargan todos los Controles y Etiquetas y se manda directo a producción con mesas exclusivas.")
+        st.info("📦 Lote: se crea un lote nuevo, se cargan todos los Controles y Etiquetas y tú defines manualmente la página que irá a cada mesa.")
         col1, col2 = st.columns(2)
         with col1:
             pdfs = st.file_uploader(
@@ -5683,6 +5840,32 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 key="s2_labels_txts",
             )
 
+        batch_preview_pages = _s2_preview_batch_pages(pdfs)
+        batch_assignments = {}
+        batch_warnings = []
+
+        if pdfs or zpls:
+            with st.container(border=True):
+                st.markdown("**Resumen del lote listo para confirmar**")
+                st.write(f"**Controles:** {', '.join(getattr(x, 'name', '-') for x in (pdfs or [])) or '-'}")
+                st.write(f"**Etiquetas:** {', '.join(getattr(x, 'name', '-') for x in (zpls or [])) or '-'}")
+                if batch_preview_pages:
+                    st.write(f"**Páginas detectadas en el lote:** {len(batch_preview_pages)}")
+                    batch_assignments, batch_warnings, _ = _s2_render_assignment_editor(
+                        batch_preview_pages,
+                        widget_prefix="s2_batch_assign",
+                    )
+                    st.dataframe(
+                        [{"Página": int(p), "Mesa": int(m)} for p, m in sorted(batch_assignments.items())],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("Sube los Controles para poder definir la asignación manual de páginas.")
+                if batch_warnings:
+                    for msg in batch_warnings:
+                        st.warning(msg)
+
         do_batch = st.button(
             "Procesar lote en una sola tanda",
             type="primary",
@@ -5695,9 +5878,12 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                 st.error("Debes subir al menos un Control (PDF).")
             elif not zpls:
                 st.error("Debes subir al menos un archivo de Etiquetas (TXT/ZPL).")
+            elif not batch_preview_pages:
+                st.error("No pude detectar páginas en los Controles del lote.")
+            elif batch_warnings:
+                st.error("Corrige la asignación Página → Mesa antes de procesar el lote.")
             else:
                 target_mid = _s2_find_empty_active_manifest() or _s2_create_new_manifest('ACTIVE')
-                next_start, mesa_block = _s2_next_global_mesa_block(default_count=3, exclude_mid=target_mid)
                 total_sales = 0
                 offset = 0
                 control_names = []
@@ -5709,8 +5895,8 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                     else:
                         offset = _s2_get_max_page(target_mid)
                         total_sales += int(_s2_append_control(target_mid, name, pdf.getvalue(), page_offset=offset) or 0)
-                pages_target = _s2_get_pages(target_mid)
-                _s2_auto_assign_specific_pages(target_mid, pages_target, start_mesa=next_start, mesas_count=mesa_block)
+
+                _s2_apply_page_assignments(target_mid, batch_assignments)
 
                 total_labels = 0
                 label_names = []
@@ -5722,7 +5908,6 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
                     else:
                         total_labels += int(_s2_append_labels(target_mid, name, z.getvalue()) or 0)
 
-                # Unificar nombres visibles
                 try:
                     conn = get_conn()
                     c = conn.cursor()
@@ -5780,7 +5965,6 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         else:
             st.info("Este lote todavía no tiene páginas asignadas.")
 
-
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Camarero")
@@ -5805,6 +5989,10 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     st.session_state["sorting_manifest_id"] = mid
     st.caption(f"Lote detectado para esta mesa: {_s2_lot_label(mid)}")
 
+    if _s2_is_mesa_closed(mid, int(mesa)):
+        st.success(f"La mesa {int(mesa)} ya fue cerrada en camarero.")
+        return
+
     if st.session_state["s2_sale_open"] is None:
         st.subheader("Escanea etiqueta (QR Flex o barra Colecta)")
         # Limpieza segura del campo de escaneo (evita StreamlitAPIException)
@@ -5823,9 +6011,20 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 nxt = _s2_next_pending_sale_in_sequence(mid, int(mesa))
                 if not nxt:
                     st.success("No hay más ventas pendientes en esta mesa.")
-                    sfx_emit("OK")
-                    st.session_state["s2_clear_label_scan"] = True
-                    st.rerun()
+                    close_cols = st.columns([1, 1])
+                    if close_cols[0].button("🔒 Cerrar mesa", key=f"s2_close_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
+                        ok_close, err_close = _s2_close_mesa(mid, int(mesa))
+                        if ok_close:
+                            sfx_emit("OK")
+                            st.session_state["s2_clear_label_scan"] = True
+                            st.rerun()
+                        else:
+                            st.error(err_close or "No se pudo cerrar la mesa.")
+                            sfx_emit("ERR")
+                    if close_cols[1].button("↻ Refrescar", key=f"s2_refresh_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
+                        st.session_state["s2_clear_label_scan"] = True
+                        st.rerun()
+                    return
                 expected_sale_id, expected_ship, expected_pack, expected_page = nxt
                 sale_id = None
                 if sid and expected_ship and str(sid) == str(expected_ship):
