@@ -15,7 +15,7 @@ from contextlib import contextmanager
 # CONFIG
 # =========================
 DB_NAME = "aurora_ml.db"
-ADMIN_PASSWORD = "aurora123"  # cambia si quieres
+ADMIN_PASSWORD = "somosdelmadrid"  # clave general admin
 NUM_MESAS = 4
 
 
@@ -584,6 +584,26 @@ def _restore_tables_from_db_bytes(db_bytes: bytes, tables: list[str]) -> tuple[b
         except Exception:
             pass
 
+def require_admin_access():
+    """Clave general única para entrar a cualquier módulo de administrador."""
+    if st.session_state.get("admin_access_granted", False):
+        return True
+
+    st.warning("🔒 Acceso restringido a administradores")
+    pwd = st.text_input("Ingresa clave general de administrador", type="password", key="admin_access_password")
+
+    if pwd:
+        if pwd == ADMIN_PASSWORD:
+            st.session_state["admin_access_granted"] = True
+            st.success("Acceso autorizado ✅")
+            st.rerun()
+        else:
+            st.error("Clave incorrecta ❌")
+
+    return False
+
+
+
 def _render_module_backup_ui(scope_key: str, scope_label: str, tables: list[str]):
     """UI para respaldar/restaurar SOLO un módulo (tablas específicas)."""
     with st.expander(f"💾 Respaldo / Restauración — {scope_label}", expanded=False):
@@ -592,11 +612,6 @@ def _render_module_backup_ui(scope_key: str, scope_label: str, tables: list[str]
             "No toca datos de otros módulos. "
             "Nota: el mapa común de códigos (sku_barcodes) no se incluye aquí."
         )
-        # Password gate sólo para acciones críticas
-        pwd2 = st.text_input("Contraseña admin", type="password", key=f"pwd_{scope_key}")
-        if pwd2 != ADMIN_PASSWORD:
-            st.info("Ingresa la contraseña para habilitar respaldo/restauración.")
-            return
 
         # Backup
         try:
@@ -3641,6 +3656,9 @@ def page_full_supervisor(inv_map_sku: dict):
 
 
 def page_full_admin():
+    if not require_admin_access():
+        return
+
     st.header("Full – Administrador (progreso)")
 
     # Respaldo/Restauración SOLO FULL (no afecta otros módulos)
@@ -3777,6 +3795,9 @@ def page_full_admin():
 # UI: ADMIN (FLEX)
 # =========================
 def page_admin():
+    if not require_admin_access():
+        return
+
     st.header("Administrador")
 
 
@@ -6267,6 +6288,9 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
+    if not require_admin_access():
+        return
+
     _s2_create_tables()
     _s2_migrate_staged_to_active()
     st.title("Administrador")
