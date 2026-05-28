@@ -5765,19 +5765,34 @@ def _s2_find_label_location(scan_or_sid: str) -> list[dict]:
 
 
 def _s2_next_pending_item(mid: int, sale_id: str):
-    """Devuelve el próximo producto pendiente de la venta para trabajar producto por producto."""
+    """Devuelve el próximo producto pendiente de la venta para trabajar producto por producto.
+
+    Corrección: s2_items NO tiene columna id en el esquema actual; usa rowid/sku para no caer con
+    sqlite3.OperationalError: no such column: id.
+    """
     conn = get_conn()
     c = conn.cursor()
-    row = c.execute("""
-        SELECT sku, description, qty, picked, status
-        FROM s2_items
-        WHERE manifest_id=? AND sale_id=? AND status='PENDING'
-        ORDER BY id
-        LIMIT 1;
-    """, (int(mid), str(sale_id))).fetchone()
+    try:
+        row = c.execute("""
+            SELECT sku, description, qty, picked, status
+            FROM s2_items
+            WHERE manifest_id=? AND sale_id=? AND COALESCE(status,'PENDING')='PENDING'
+            ORDER BY rowid, sku
+            LIMIT 1;
+        """, (int(mid), str(sale_id))).fetchone()
+    except sqlite3.OperationalError:
+        try:
+            row = c.execute("""
+                SELECT sku, description, qty, picked, status
+                FROM s2_items
+                WHERE manifest_id=? AND sale_id=? AND COALESCE(status,'PENDING')='PENDING'
+                ORDER BY sku
+                LIMIT 1;
+            """, (int(mid), str(sale_id))).fetchone()
+        except sqlite3.OperationalError:
+            row = None
     conn.close()
     return row
-
 
 def _s2_title_for_sku(inv_map_sku, sku: str, fallback: str = "") -> str:
     title = ""
