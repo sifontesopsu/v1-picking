@@ -6586,8 +6586,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     st.session_state["s2_pending_title"] = ""
                     st.rerun()
         with cB:
-            st.markdown("**⚠️ FALTANTE**")
-            st.caption("Selecciona cuántas unidades faltan. No edites cantidad.")
+            st.caption("Si no está completo, selecciona cuántas unidades faltan.")
 
         # Faltante visual rápido: botones por cantidad faltante.
         # Para qty=1 es un único botón. Para qty>1 permite faltante parcial sin escribir.
@@ -6610,7 +6609,8 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         if int(pending_qty) > 12:
             st.caption("Para cantidades mayores a 12, usa el botón que refleje el faltante real si está visible; si no, marca faltante total y revisa en supervisor.")
 
-    if next_item:
+    # Si ya se validó un producto, no mostramos otra tarjeta debajo: primero se debe cerrar el conteo visual.
+    if (not pending_sku) and next_item:
         sku, desc, qty, picked, status = next_item
         title = ""
         if isinstance(inv_map_sku, dict):
