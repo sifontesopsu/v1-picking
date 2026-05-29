@@ -6524,10 +6524,26 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     if pending_sku:
         pending_qty = int(st.session_state.get("s2_pending_qty", 0) or 0)
         pending_title = st.session_state.get("s2_pending_title", "") or pending_sku
-        st.warning(f"Verificar **{pending_qty}** unidad(es) para: **{pending_title}**")
+
+        st.markdown(
+            f"""
+            <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:14px; padding:18px 20px; margin:8px 0 14px 0;">
+              <div style="font-size:14px; font-weight:700; color:#166534; letter-spacing:.04em;">PRODUCTO VALIDADO · AHORA CONTAR</div>
+              <div style="font-size:22px; font-weight:800; margin-top:6px; color:#111827;">{html.escape(str(pending_title))}</div>
+              <div style="display:flex; align-items:flex-end; gap:18px; margin-top:10px;">
+                <div style="font-size:16px; color:#374151; font-weight:700;">DEBEN HABER</div>
+                <div style="font-size:82px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
+                <div style="font-size:20px; color:#374151; font-weight:800; padding-bottom:8px;">UNIDAD(ES)</div>
+              </div>
+              <div style="font-size:13px; color:#475569; margin-top:10px;">Cuenta físicamente. No escanees unidad por unidad.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         cA, cB = st.columns([2, 1])
         with cA:
-            if st.button(f"✅ Verificar {pending_qty} y cerrar producto", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
+            if st.button(f"✅ COMPLETO · están las {pending_qty}", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
                 ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
                 if not ok:
                     st.error(msg or "No se pudo aplicar.")
@@ -6539,7 +6555,9 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     st.session_state["s2_pending_title"] = ""
                     st.rerun()
         with cB:
-            if st.button("Cancelar", key=f"s2_verify_cancel_{sale_id}_{pending_sku}", use_container_width=True):
+            if st.button("⚠️ FALTANTE", key=f"s2_pending_inc_{sale_id}_{pending_sku}", use_container_width=True):
+                _s2_mark_incidence(mid, sale_id, str(pending_sku))
+                sfx_emit("ERR")
                 st.session_state["s2_pending_sku"] = None
                 st.session_state["s2_pending_qty"] = 0
                 st.session_state["s2_pending_title"] = ""
