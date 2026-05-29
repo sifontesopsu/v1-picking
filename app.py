@@ -6765,25 +6765,27 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             st.info("No hay productos para esta venta.")
 
     done = _s2_is_sale_done(mid, sale_id)
-    with st.expander("6. Cerrar venta", expanded=False):
-        if done:
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                confirm_close = st.checkbox("Confirmo cierre", key=f"s2_confirm_close_{sale_id}")
-            with c2:
-                if st.button("✅ Cerrar venta y volver a escanear etiqueta", key=f"s2_close_{sale_id}", use_container_width=True, disabled=not confirm_close):
-                    _s2_close_sale(mid, sale_id)
-                    st.session_state["s2_sale_open"] = None
-                    st.session_state["s2_sale_open_manifest_id"] = None
-                    st.session_state["s2_sale_open_mesa"] = None
-                    st.session_state["s2_pending_sku"] = None
-                    st.session_state["s2_pending_qty"] = 0
-                    st.session_state["s2_pending_title"] = ""
-                    st.session_state["s2_clear_prod_scan"] = True
-                    st.session_state["s2_clear_label_scan"] = True
-                    st.rerun()
-        else:
-            st.info("Para cerrar: completa el producto actual y luego los siguientes, o marca Faltante / Sin EAN.")
+    # Cierre directo: sin desplegable y sin doble confirmación.
+    # El botón solo se habilita cuando todos los productos de la venta están procesados.
+    st.markdown("### 6. Cerrar venta")
+    if st.button(
+        "✅ Cerrar venta y volver a escanear etiqueta",
+        key=f"s2_close_{sale_id}",
+        use_container_width=True,
+        disabled=not done,
+    ):
+        _s2_close_sale(mid, sale_id)
+        st.session_state["s2_sale_open"] = None
+        st.session_state["s2_sale_open_manifest_id"] = None
+        st.session_state["s2_sale_open_mesa"] = None
+        st.session_state["s2_pending_sku"] = None
+        st.session_state["s2_pending_qty"] = 0
+        st.session_state["s2_pending_title"] = ""
+        st.session_state["s2_clear_prod_scan"] = True
+        st.session_state["s2_clear_label_scan"] = True
+        st.rerun()
+    if not done:
+        st.info("Para cerrar: procesa todos los productos de la venta. Puedes marcar Completo, Faltante o Sin EAN según corresponda.")
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
