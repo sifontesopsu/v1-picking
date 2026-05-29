@@ -6455,7 +6455,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             label_visibility="collapsed",
         )
         autofocus_input("Escanea producto")
-        st.caption("Enfoca el lector y escanea. Se validará el producto y se avanzará automáticamente.")
 
         sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
         if sku_scan and not pending_sku:
@@ -6538,7 +6537,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     raw_label = _s2_get_label_raw(mid, shipment_id) if shipment_id else ""
     info = _s2_parse_label_raw_info(raw_label)
 
-    st.info(f"Venta abierta: {sale_id} · Mesa {mesa_db} · Página {page_no}")
 
     items = _s2_sale_items(mid, sale_id)
     total_items = len(items)
