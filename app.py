@@ -6680,10 +6680,31 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     st.progress(0 if total_items == 0 else done_items / total_items)
     st.caption(f"Avance venta: {done_items}/{total_items} productos finalizados")
 
+    done = _s2_is_sale_done(mid, sale_id)
+    st.markdown("**Cerrar venta**")
+    if st.button(
+        "✅ Cerrar venta y volver a escanear etiqueta",
+        key=f"s2_close_{sale_id}",
+        use_container_width=True,
+        disabled=not done,
+    ):
+        _s2_close_sale(mid, sale_id)
+        st.session_state[sale_key] = None
+        st.session_state[manifest_key] = None
+        st.session_state[sale_mesa_key] = None
+        st.session_state[pending_sku_key] = None
+        st.session_state[pending_qty_key] = 0
+        st.session_state[pending_title_key] = ""
+        st.session_state["s2_clear_prod_scan"] = True
+        st.session_state["s2_clear_label_scan"] = True
+        st.rerun()
+    if not done:
+        st.caption("Se habilita al completar todos los productos.")
+
     # =========================
     # DETALLES ABAJO, ABIERTOS POR DEFECTO
     # =========================
-    with st.expander(f"🏷️ 3. Etiquetas asignadas a Mesa {int(mesa)}", expanded=False):
+    with st.expander(f"🏷️ 4. Etiquetas asignadas a Mesa {int(mesa)}", expanded=False):
         conn = get_conn()
         c = conn.cursor()
         rows = c.execute("""
@@ -6699,7 +6720,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         else:
             st.info("No hay etiquetas asignadas a esta mesa.")
 
-    with st.expander("4. Información etiqueta / cliente", expanded=False):
+    with st.expander("5. Información etiqueta / cliente", expanded=False):
         a, b, cx = st.columns(3)
         a.metric("Envío", str(shipment_id) if shipment_id else "-")
         b.metric("Pack ID", str(pack_id) if pack_id else "-")
@@ -6718,7 +6739,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         if ciudad_dest and ciudad_dest != "-":
             st.write(f"**Ciudad destino:** {ciudad_dest}")
 
-    with st.expander(f"5. Lista completa de productos de la venta ({done_items}/{total_items} finalizados)", expanded=False):
+    with st.expander(f"6. Lista completa de productos de la venta ({done_items}/{total_items} finalizados)", expanded=False):
         if items:
             rows = []
             for idx, (sku, desc, qty, picked, status) in enumerate(items, start=1):
@@ -6739,29 +6760,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
             st.info("No hay productos para esta venta.")
-
-    done = _s2_is_sale_done(mid, sale_id)
-    # Cierre directo: sin desplegable y sin doble confirmación.
-    # El botón solo se habilita cuando todos los productos de la venta están procesados.
-    st.markdown("**Cerrar venta**")
-    if st.button(
-        "✅ Cerrar venta y volver a escanear etiqueta",
-        key=f"s2_close_{sale_id}",
-        use_container_width=True,
-        disabled=not done,
-    ):
-        _s2_close_sale(mid, sale_id)
-        st.session_state[sale_key] = None
-        st.session_state[manifest_key] = None
-        st.session_state[sale_mesa_key] = None
-        st.session_state[pending_sku_key] = None
-        st.session_state[pending_qty_key] = 0
-        st.session_state[pending_title_key] = ""
-        st.session_state["s2_clear_prod_scan"] = True
-        st.session_state["s2_clear_label_scan"] = True
-        st.rerun()
-    if not done:
-        st.info("Para cerrar: procesa todos los productos de la venta. Puedes marcar Completo, Faltante o Sin EAN según corresponda.")
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
