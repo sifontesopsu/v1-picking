@@ -6235,7 +6235,9 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
 
 
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
-    """Camarero compacto: scanner primero, producto actual segundo, detalles abajo."""
+    """Camarero compacto: scanner primero, producto actual segundo, detalles abajo.
+    BUILD: COMPACTO_227_MINIATURA_SIN_BOTON_LISTAS_RECOGIDAS
+    """
     _s2_create_tables()
     _s2_ensure_items_schema_runtime()
 
@@ -6425,7 +6427,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     # =========================
     if sale_id is None:
         # Sin venta abierta: mostrar mesa abajo, no arriba
-        with st.expander(f"🏷️ Etiquetas asignadas a Mesa {int(mesa)}", expanded=True):
+        with st.expander(f"🏷️ Etiquetas asignadas a Mesa {int(mesa)}", expanded=False):
             conn = get_conn()
             c = conn.cursor()
             rows = c.execute("""
@@ -6533,21 +6535,13 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 m2.metric("Verificado", int(picked))
                 m3.metric("Falta", faltan)
 
-                b1, b2, b3 = st.columns(3)
-                if b1.button("🖼️ Ver imagen", key=f"s2_btnimg_current_{sale_id}_{sku}", use_container_width=True):
-                    st.session_state[f"s2_showimg_current_{sale_id}_{sku}"] = not bool(st.session_state.get(f"s2_showimg_current_{sale_id}_{sku}", False))
-                if b2.button("⚠️ Incidencia", key=f"s2_inc_current_{sale_id}_{sku}", use_container_width=True):
+                b1, b2 = st.columns(2)
+                if b1.button("⚠️ Incidencia", key=f"s2_inc_current_{sale_id}_{sku}", use_container_width=True):
                     _s2_mark_incidence(mid, sale_id, str(sku))
                     st.rerun()
-                if b3.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
+                if b2.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
                     _s2_force_done_no_ean(mid, sale_id, str(sku))
                     st.rerun()
-
-                if st.session_state.get(f"s2_showimg_current_{sale_id}_{sku}", False):
-                    if pics:
-                        st.image(pics[0], width=240)
-                    else:
-                        st.caption("Sin imagen disponible")
     else:
         st.success("✅ No quedan productos pendientes en esta venta.")
 
@@ -6557,7 +6551,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     # =========================
     # DETALLES ABAJO, ABIERTOS POR DEFECTO
     # =========================
-    with st.expander(f"🏷️ 3. Etiquetas asignadas a Mesa {int(mesa)}", expanded=True):
+    with st.expander(f"🏷️ 3. Etiquetas asignadas a Mesa {int(mesa)}", expanded=False):
         conn = get_conn()
         c = conn.cursor()
         rows = c.execute("""
@@ -6573,7 +6567,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         else:
             st.info("No hay etiquetas asignadas a esta mesa.")
 
-    with st.expander("4. Información etiqueta / cliente", expanded=True):
+    with st.expander("4. Información etiqueta / cliente", expanded=False):
         a, b, cx = st.columns(3)
         a.metric("Envío", str(shipment_id) if shipment_id else "-")
         b.metric("Pack ID", str(pack_id) if pack_id else "-")
@@ -6592,7 +6586,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         if ciudad_dest and ciudad_dest != "-":
             st.write(f"**Ciudad destino:** {ciudad_dest}")
 
-    with st.expander(f"5. Lista completa de productos de la venta ({done_items}/{total_items} finalizados)", expanded=True):
+    with st.expander(f"5. Lista completa de productos de la venta ({done_items}/{total_items} finalizados)", expanded=False):
         if items:
             rows = []
             for idx, (sku, desc, qty, picked, status) in enumerate(items, start=1):
@@ -6615,7 +6609,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             st.info("No hay productos para esta venta.")
 
     done = _s2_is_sale_done(mid, sale_id)
-    with st.expander("6. Cerrar venta", expanded=True):
+    with st.expander("6. Cerrar venta", expanded=False):
         if done:
             c1, c2 = st.columns([1, 2])
             with c1:
