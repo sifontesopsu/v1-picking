@@ -6556,60 +6556,85 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         pending_qty = int(st.session_state.get("s2_pending_qty", 0) or 0)
         pending_title = st.session_state.get("s2_pending_title", "") or pending_sku
 
-        st.markdown(
-            f"""
-            <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:14px; padding:18px 20px; margin:8px 0 14px 0;">
-              <div style="font-size:14px; font-weight:700; color:#166534; letter-spacing:.04em;">PRODUCTO VALIDADO · AHORA CONTAR</div>
-              <div style="font-size:22px; font-weight:800; margin-top:6px; color:#111827;">{html.escape(str(pending_title))}</div>
-              <div style="display:flex; align-items:flex-end; gap:18px; margin-top:10px;">
-                <div style="font-size:16px; color:#374151; font-weight:700;">DEBEN HABER</div>
-                <div style="font-size:82px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
-                <div style="font-size:20px; color:#374151; font-weight:800; padding-bottom:8px;">UNIDAD(ES)</div>
-              </div>
-              <div style="font-size:13px; color:#475569; margin-top:10px;">Cuenta físicamente. No escanees unidad por unidad.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        # Miniatura visible también durante el conteo validado.
+        try:
+            pending_pics, _pending_pub_link = get_picture_urls_for_sku(str(pending_sku))
+        except Exception:
+            pending_pics, _pending_pub_link = [], ""
 
-        cA, cB = st.columns([2, 1])
-        with cA:
-            if st.button(f"✅ COMPLETO · están las {pending_qty}", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
-                ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
-                if not ok:
-                    st.error(msg or "No se pudo aplicar.")
-                    sfx_emit("ERR")
+        validated_card = st.container(border=True)
+        with validated_card:
+            img_col, info_col = st.columns([1, 6])
+            with img_col:
+                st.markdown(" ")
+                if pending_pics:
+                    st.image(pending_pics[0], use_container_width=True)
                 else:
-                    sfx_emit("OK")
-                    st.session_state["s2_pending_sku"] = None
-                    st.session_state["s2_pending_qty"] = 0
-                    st.session_state["s2_pending_title"] = ""
-                    st.rerun()
-        with cB:
-            st.caption("Si no está completo, selecciona cuántas unidades faltan.")
+                    st.caption("Sin imagen")
+            with info_col:
+                st.markdown(
+                    f"""
+                    <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:14px; padding:18px 20px; margin:0 0 12px 0;">
+                      <div style="font-size:14px; font-weight:700; color:#166534; letter-spacing:.04em;">PRODUCTO VALIDADO · AHORA CONTAR</div>
+                      <div style="font-size:24px; font-weight:900; margin-top:6px; color:#111827;">{html.escape(str(pending_title))}</div>
+                      <div style="display:flex; align-items:flex-end; gap:18px; margin-top:10px;">
+                        <div style="font-size:16px; color:#374151; font-weight:700;">DEBEN HABER</div>
+                        <div style="font-size:86px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
+                        <div style="font-size:20px; color:#374151; font-weight:800; padding-bottom:8px;">UNIDAD(ES)</div>
+                      </div>
+                      <div style="font-size:13px; color:#475569; margin-top:10px;">Cuenta físicamente. No escanees unidad por unidad.</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-        # Faltante visual rápido: botones por cantidad faltante.
-        # Para qty=1 es un único botón. Para qty>1 permite faltante parcial sin escribir.
-        max_missing_buttons = min(int(pending_qty), 12)
-        miss_cols = st.columns(max_missing_buttons if max_missing_buttons > 0 else 1)
-        for miss in range(1, max_missing_buttons + 1):
-            with miss_cols[miss-1]:
-                label = f"Falta {miss}" if int(pending_qty) > 1 else "⚠️ Falta 1"
-                if st.button(label, key=f"s2_short_{sale_id}_{pending_sku}_{miss}", use_container_width=True):
-                    ok, msg = _s2_mark_shortage(mid, sale_id, str(pending_sku), int(miss))
-                    if not ok:
-                        st.error(msg or "No se pudo registrar faltante.")
-                        sfx_emit("ERR")
-                    else:
-                        sfx_emit("ERR")
-                        st.session_state["s2_pending_sku"] = None
-                        st.session_state["s2_pending_qty"] = 0
-                        st.session_state["s2_pending_title"] = ""
-                        st.rerun()
-        if int(pending_qty) > 12:
-            st.caption("Para cantidades mayores a 12, usa el botón que refleje el faltante real si está visible; si no, marca faltante total y revisa en supervisor.")
+                cA, cB = st.columns([2, 1])
+                with cA:
+                    if st.button(f"✅ COMPLETO · están las {pending_qty}", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
+                        ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
+                        if not ok:
+                            st.error(msg or "No se pudo aplicar.")
+                            sfx_emit("ERR")
+                        else:
+                            sfx_emit("OK")
+                            st.session_state["s2_pending_sku"] = None
+                            st.session_state["s2_pending_qty"] = 0
+                            st.session_state["s2_pending_title"] = ""
+                            st.session_state.pop("s2_show_shortage_form", None)
+                            st.rerun()
+                with cB:
+                    if st.button("⚠️ FALTANTE", key=f"s2_short_open_{sale_id}_{pending_sku}", use_container_width=True):
+                        st.session_state["s2_show_shortage_form"] = f"{sale_id}|{pending_sku}"
 
-    # Si ya se validó un producto, no mostramos otra tarjeta debajo: primero se debe cerrar el conteo visual.
+                if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{pending_sku}":
+                    st.warning("Indica cuántas unidades faltan físicamente.")
+                    miss_val = st.number_input(
+                        "Unidades faltantes",
+                        min_value=1,
+                        max_value=max(1, int(pending_qty)),
+                        value=1,
+                        step=1,
+                        key=f"s2_missing_qty_{sale_id}_{pending_sku}",
+                    )
+                    f1, f2 = st.columns([1, 1])
+                    with f1:
+                        if st.button("✅ Registrar faltante", key=f"s2_short_confirm_{sale_id}_{pending_sku}", use_container_width=True):
+                            ok, msg = _s2_mark_shortage(mid, sale_id, str(pending_sku), int(miss_val))
+                            if not ok:
+                                st.error(msg or "No se pudo registrar faltante.")
+                                sfx_emit("ERR")
+                            else:
+                                sfx_emit("ERR")
+                                st.session_state["s2_pending_sku"] = None
+                                st.session_state["s2_pending_qty"] = 0
+                                st.session_state["s2_pending_title"] = ""
+                                st.session_state.pop("s2_show_shortage_form", None)
+                                st.rerun()
+                    with f2:
+                        if st.button("Cancelar faltante", key=f"s2_short_cancel_{sale_id}_{pending_sku}", use_container_width=True):
+                            st.session_state.pop("s2_show_shortage_form", None)
+                            st.rerun()
+
     if (not pending_sku) and next_item:
         sku, desc, qty, picked, status = next_item
         title = ""
@@ -6641,14 +6666,38 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 m3.metric("Falta", faltan)
 
                 b1, b2 = st.columns(2)
-                if b1.button("⚠️ Faltante", key=f"s2_short_current_{sale_id}_{sku}", use_container_width=True):
-                    # Sin escaneo del producto: se considera faltante total para este SKU.
-                    # El flujo recomendado para faltante parcial es escanear una vez y escoger cuántas faltan arriba.
-                    _s2_mark_shortage(mid, sale_id, str(sku), int(faltan or 1))
-                    st.rerun()
+                if b1.button("⚠️ FALTANTE", key=f"s2_short_current_open_{sale_id}_{sku}", use_container_width=True):
+                    st.session_state["s2_show_shortage_form"] = f"{sale_id}|{sku}"
                 if b2.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
                     _s2_force_done_no_ean(mid, sale_id, str(sku))
+                    st.session_state.pop("s2_show_shortage_form", None)
                     st.rerun()
+
+                if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{sku}":
+                    st.warning("Indica cuántas unidades faltan físicamente.")
+                    miss_val_current = st.number_input(
+                        "Unidades faltantes",
+                        min_value=1,
+                        max_value=max(1, int(faltan or 1)),
+                        value=1,
+                        step=1,
+                        key=f"s2_missing_qty_current_{sale_id}_{sku}",
+                    )
+                    f1, f2 = st.columns([1, 1])
+                    with f1:
+                        if st.button("✅ Registrar faltante", key=f"s2_short_current_confirm_{sale_id}_{sku}", use_container_width=True):
+                            ok, msg = _s2_mark_shortage(mid, sale_id, str(sku), int(miss_val_current))
+                            if not ok:
+                                st.error(msg or "No se pudo registrar faltante.")
+                                sfx_emit("ERR")
+                            else:
+                                sfx_emit("ERR")
+                                st.session_state.pop("s2_show_shortage_form", None)
+                                st.rerun()
+                    with f2:
+                        if st.button("Cancelar faltante", key=f"s2_short_current_cancel_{sale_id}_{sku}", use_container_width=True):
+                            st.session_state.pop("s2_show_shortage_form", None)
+                            st.rerun()
     else:
         st.success("✅ No quedan productos pendientes en esta venta.")
 
