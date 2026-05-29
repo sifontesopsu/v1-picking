@@ -2778,7 +2778,7 @@ def page_picking():
     except Exception:
         pics, pub_link = [], ""
     if pics:
-        st.image(pics[0], use_container_width=True)
+        st.image(pics[0], width=55)
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
                 st.image(pics, use_container_width=True)
@@ -6537,75 +6537,73 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
         validated_card = st.container(border=True)
         with validated_card:
-            img_col, info_col = st.columns([1, 5])
-            with img_col:
-                st.markdown(" ")
-                if pending_pics:
-                    st.image(pending_pics[0], use_container_width=True)
-                else:
-                    st.caption("Sin imagen")
-            with info_col:
-                st.markdown(
-                    f"""
-                    <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:12px; padding:10px 12px; margin:0 0 6px 0;">
-                      <div style="font-size:11px; font-weight:800; color:#166534; letter-spacing:.04em;">VALIDADO · CONTAR</div>
-                      <div style="font-size:18px; font-weight:900; margin-top:3px; color:#111827; line-height:1.15;">{html.escape(str(pending_title))}</div>
-                      <div style="display:flex; align-items:flex-end; gap:10px; margin-top:4px;">
-                        <div style="font-size:13px; color:#374151; font-weight:800; padding-bottom:6px;">DEBEN HABER</div>
-                        <div style="font-size:56px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
-                        <div style="font-size:14px; color:#374151; font-weight:800; padding-bottom:7px;">UNIDAD(ES)</div>
-                      </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+            # En PDA evitamos columnas: primero información y acciones; miniatura pequeña abajo.
+            st.markdown(
+                f"""
+                <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:12px; padding:8px 10px; margin:0 0 6px 0;">
+                  <div style="font-size:11px; font-weight:800; color:#166534; letter-spacing:.04em;">VALIDADO · CONTAR</div>
+                  <div style="font-size:17px; font-weight:900; margin-top:2px; color:#111827; line-height:1.12;">{html.escape(str(pending_title))}</div>
+                  <div style="display:flex; align-items:flex-end; gap:8px; margin-top:2px;">
+                    <div style="font-size:12px; color:#374151; font-weight:800; padding-bottom:5px;">DEBEN HABER</div>
+                    <div style="font-size:46px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
+                    <div style="font-size:12px; color:#374151; font-weight:800; padding-bottom:6px;">UNIDAD(ES)</div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-                cA, cB = st.columns([2, 1])
-                with cA:
-                    if st.button(f"✅ COMPLETO · están las {pending_qty}", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
-                        ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
+            cA, cB = st.columns([2, 1])
+            with cA:
+                if st.button(f"✅ COMPLETO · están las {pending_qty}", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
+                    ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
+                    if not ok:
+                        st.error(msg or "No se pudo aplicar.")
+                        sfx_emit("ERR")
+                    else:
+                        sfx_emit("OK")
+                        st.session_state[pending_sku_key] = None
+                        st.session_state[pending_qty_key] = 0
+                        st.session_state[pending_title_key] = ""
+                        st.session_state.pop("s2_show_shortage_form", None)
+                        st.rerun()
+            with cB:
+                if st.button("⚠️ FALTANTE", key=f"s2_short_open_{sale_id}_{pending_sku}", use_container_width=True):
+                    st.session_state["s2_show_shortage_form"] = f"{sale_id}|{pending_sku}"
+
+            if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{pending_sku}":
+                st.warning("Indica cuántas unidades faltan físicamente.")
+                miss_val = st.number_input(
+                    "Unidades faltantes",
+                    min_value=1,
+                    max_value=max(1, int(pending_qty)),
+                    value=1,
+                    step=1,
+                    key=f"s2_missing_qty_{sale_id}_{pending_sku}",
+                )
+                f1, f2 = st.columns([1, 1])
+                with f1:
+                    if st.button("✅ Registrar faltante", key=f"s2_short_confirm_{sale_id}_{pending_sku}", use_container_width=True):
+                        ok, msg = _s2_mark_shortage(mid, sale_id, str(pending_sku), int(miss_val))
                         if not ok:
-                            st.error(msg or "No se pudo aplicar.")
+                            st.error(msg or "No se pudo registrar faltante.")
                             sfx_emit("ERR")
                         else:
-                            sfx_emit("OK")
+                            sfx_emit("ERR")
                             st.session_state[pending_sku_key] = None
                             st.session_state[pending_qty_key] = 0
                             st.session_state[pending_title_key] = ""
                             st.session_state.pop("s2_show_shortage_form", None)
                             st.rerun()
-                with cB:
-                    if st.button("⚠️ FALTANTE", key=f"s2_short_open_{sale_id}_{pending_sku}", use_container_width=True):
-                        st.session_state["s2_show_shortage_form"] = f"{sale_id}|{pending_sku}"
+                with f2:
+                    if st.button("Cancelar faltante", key=f"s2_short_cancel_{sale_id}_{pending_sku}", use_container_width=True):
+                        st.session_state.pop("s2_show_shortage_form", None)
+                        st.rerun()
 
-                if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{pending_sku}":
-                    st.warning("Indica cuántas unidades faltan físicamente.")
-                    miss_val = st.number_input(
-                        "Unidades faltantes",
-                        min_value=1,
-                        max_value=max(1, int(pending_qty)),
-                        value=1,
-                        step=1,
-                        key=f"s2_missing_qty_{sale_id}_{pending_sku}",
-                    )
-                    f1, f2 = st.columns([1, 1])
-                    with f1:
-                        if st.button("✅ Registrar faltante", key=f"s2_short_confirm_{sale_id}_{pending_sku}", use_container_width=True):
-                            ok, msg = _s2_mark_shortage(mid, sale_id, str(pending_sku), int(miss_val))
-                            if not ok:
-                                st.error(msg or "No se pudo registrar faltante.")
-                                sfx_emit("ERR")
-                            else:
-                                sfx_emit("ERR")
-                                st.session_state[pending_sku_key] = None
-                                st.session_state[pending_qty_key] = 0
-                                st.session_state[pending_title_key] = ""
-                                st.session_state.pop("s2_show_shortage_form", None)
-                                st.rerun()
-                    with f2:
-                        if st.button("Cancelar faltante", key=f"s2_short_cancel_{sale_id}_{pending_sku}", use_container_width=True):
-                            st.session_state.pop("s2_show_shortage_form", None)
-                            st.rerun()
+            if pending_pics:
+                st.image(pending_pics[0], width=55)
+            else:
+                st.caption("Sin imagen")
 
     if (not pending_sku) and next_item:
         sku, desc, qty, picked, status = next_item
@@ -6618,64 +6616,64 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
         card = st.container(border=True)
         with card:
-            left, right = st.columns([1, 6])
-            with left:
-                st.markdown(" ")
-                try:
-                    pics, _pub_link = get_picture_urls_for_sku(str(sku))
-                except Exception:
-                    pics, _pub_link = [], ""
-                if pics:
-                    st.image(pics[0], use_container_width=True)
-                else:
-                    st.caption("Sin imagen")
-            with right:
-                st.markdown(f"### {title}")
-                st.caption(f"SKU: {sku}")
-                st.markdown(
-                    f"""
-                    <div style="border:1px solid #e5e7eb; background:#f8fafc; border-radius:10px; padding:8px 10px; margin:4px 0 8px 0;">
-                      <div style="font-size:13px; font-weight:900; color:#374151; letter-spacing:.02em;">FALTAN</div>
-                      <div style="font-size:42px; line-height:.9; font-weight:950; color:#111827; margin-top:2px;">{faltan}</div>
-                      <div style="font-size:12px; font-weight:700; color:#6b7280; margin-top:4px;">{int(picked)} / {int(qty)} verificadas</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+            # En PDA las columnas se apilan; por eso el título va primero y la imagen queda pequeña abajo.
+            st.markdown(f"### {title}")
+            st.caption(f"SKU: {sku}")
+
+            # Acciones arriba para no obligar a bajar con el lector.
+            b1, b2 = st.columns(2)
+            if b1.button("⚠️ FALTANTE", key=f"s2_short_current_open_{sale_id}_{sku}", use_container_width=True):
+                st.session_state["s2_show_shortage_form"] = f"{sale_id}|{sku}"
+            if b2.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
+                _s2_force_done_no_ean(mid, sale_id, str(sku))
+                st.session_state.pop("s2_show_shortage_form", None)
+                st.rerun()
+
+            if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{sku}":
+                st.warning("Indica cuántas unidades faltan físicamente.")
+                miss_val_current = st.number_input(
+                    "Unidades faltantes",
+                    min_value=1,
+                    max_value=max(1, int(faltan or 1)),
+                    value=1,
+                    step=1,
+                    key=f"s2_missing_qty_current_{sale_id}_{sku}",
                 )
-
-                b1, b2 = st.columns(2)
-                if b1.button("⚠️ FALTANTE", key=f"s2_short_current_open_{sale_id}_{sku}", use_container_width=True):
-                    st.session_state["s2_show_shortage_form"] = f"{sale_id}|{sku}"
-                if b2.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
-                    _s2_force_done_no_ean(mid, sale_id, str(sku))
-                    st.session_state.pop("s2_show_shortage_form", None)
-                    st.rerun()
-
-                if st.session_state.get("s2_show_shortage_form") == f"{sale_id}|{sku}":
-                    st.warning("Indica cuántas unidades faltan físicamente.")
-                    miss_val_current = st.number_input(
-                        "Unidades faltantes",
-                        min_value=1,
-                        max_value=max(1, int(faltan or 1)),
-                        value=1,
-                        step=1,
-                        key=f"s2_missing_qty_current_{sale_id}_{sku}",
-                    )
-                    f1, f2 = st.columns([1, 1])
-                    with f1:
-                        if st.button("✅ Registrar faltante", key=f"s2_short_current_confirm_{sale_id}_{sku}", use_container_width=True):
-                            ok, msg = _s2_mark_shortage(mid, sale_id, str(sku), int(miss_val_current))
-                            if not ok:
-                                st.error(msg or "No se pudo registrar faltante.")
-                                sfx_emit("ERR")
-                            else:
-                                sfx_emit("ERR")
-                                st.session_state.pop("s2_show_shortage_form", None)
-                                st.rerun()
-                    with f2:
+                f1, f2 = st.columns([1, 1])
+                with f1:
+                    if st.button("✅ Registrar faltante", key=f"s2_short_current_confirm_{sale_id}_{sku}", use_container_width=True):
+                        ok, msg = _s2_mark_shortage(mid, sale_id, str(sku), int(miss_val_current))
+                        if not ok:
+                            st.error(msg or "No se pudo registrar faltante.")
+                            sfx_emit("ERR")
+                        else:
+                            sfx_emit("ERR")
+                            st.session_state.pop("s2_show_shortage_form", None)
+                            st.rerun()
+                with f2:
                         if st.button("Cancelar faltante", key=f"s2_short_current_cancel_{sale_id}_{sku}", use_container_width=True):
                             st.session_state.pop("s2_show_shortage_form", None)
                             st.rerun()
+
+            st.markdown(
+                f"""
+                <div style="border:1px solid #e5e7eb; background:#f8fafc; border-radius:10px; padding:7px 9px; margin:6px 0 6px 0;">
+                  <div style="font-size:12px; font-weight:900; color:#374151; letter-spacing:.02em;">FALTAN</div>
+                  <div style="font-size:38px; line-height:.9; font-weight:950; color:#111827; margin-top:1px;">{faltan}</div>
+                  <div style="font-size:12px; font-weight:700; color:#6b7280; margin-top:3px;">{int(picked)} / {int(qty)} verificadas</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            try:
+                pics, _pub_link = get_picture_urls_for_sku(str(sku))
+            except Exception:
+                pics, _pub_link = [], ""
+            if pics:
+                st.image(pics[0], width=55)
+            else:
+                st.caption("Sin imagen")
     else:
         st.success("✅ No quedan productos pendientes en esta venta.")
 
