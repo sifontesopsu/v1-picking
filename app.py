@@ -6272,22 +6272,23 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     _s2_ensure_items_schema_runtime()
 
-    st.title("Camarero")
-    st.caption("Escaneo por etiqueta y verificación producto por producto")
+    st.markdown("""
+    <style>
+    /* Compactación específica para Camarero/PDA */
+    .block-container {padding-top: 0.6rem !important; padding-bottom: 0.6rem !important;}
+    div[data-testid="stVerticalBlock"] > div {gap: 0.35rem;}
+    div[data-testid="stHorizontalBlock"] {gap: 0.55rem;}
+    .stTextInput input {height: 2.35rem !important; font-size: 0.95rem !important;}
+    .stNumberInput input {height: 2.35rem !important;}
+    button[kind="secondary"], .stButton button {min-height: 2.15rem !important; padding-top: 0.25rem !important; padding-bottom: 0.25rem !important;}
+    h1, h2, h3 {margin-top: 0.2rem !important; margin-bottom: 0.25rem !important;}
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown("### Camarero")
 
-    # Estado base
-    if "s2_sale_open" not in st.session_state:
-        st.session_state[sale_key] = None
-    if "s2_sale_open_manifest_id" not in st.session_state:
-        st.session_state[manifest_key] = None
-    if "s2_pending_sku" not in st.session_state:
-        st.session_state[pending_sku_key] = None
-        st.session_state[pending_qty_key] = 0
-        st.session_state[pending_title_key] = ""
-
-    # Selector de mesa compacto arriba a la derecha
-    h1, h2 = st.columns([7, 1])
-    with h2:
+    # Selector de mesa compacto arriba
+    _mesa_spacer, _mesa_col = st.columns([5, 1])
+    with _mesa_col:
         mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
     st.session_state["s2_mesa_int"] = int(mesa)
 
@@ -6325,7 +6326,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     # =========================
     # 1) SCANNER SIEMPRE PRIMERO
     # =========================
-    st.markdown("### 1. Escanear etiqueta / producto")
+    st.markdown("**Escanear etiqueta / producto**")
 
     if sale_id is None:
         if st.session_state.get("s2_clear_label_scan"):
@@ -6413,8 +6414,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                             st.error(f"No encontré esta etiqueta en los manifiestos. Próxima esperada para Mesa {int(mesa)}: `{exp_id}` · Página {expected_page}.")
                         sfx_emit("ERR")
 
-        st.caption("Escanea la próxima etiqueta asignada a esta mesa. La venta se abrirá automáticamente.")
-
+    
     else:
         # Limpieza segura del campo de producto
         if st.session_state.get("s2_clear_prod_scan"):
@@ -6522,7 +6522,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     # =========================
     # 2) PRODUCTO ACTUAL SEGUNDO
     # =========================
-    st.markdown("### 2. Producto actual")
+    st.markdown("**Producto actual**")
 
     pending_sku = st.session_state.get(pending_sku_key)
     if pending_sku:
@@ -6537,7 +6537,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
         validated_card = st.container(border=True)
         with validated_card:
-            img_col, info_col = st.columns([1, 6])
+            img_col, info_col = st.columns([1, 5])
             with img_col:
                 st.markdown(" ")
                 if pending_pics:
@@ -6547,15 +6547,14 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             with info_col:
                 st.markdown(
                     f"""
-                    <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:14px; padding:18px 20px; margin:0 0 12px 0;">
-                      <div style="font-size:14px; font-weight:700; color:#166534; letter-spacing:.04em;">PRODUCTO VALIDADO · AHORA CONTAR</div>
-                      <div style="font-size:24px; font-weight:900; margin-top:6px; color:#111827;">{html.escape(str(pending_title))}</div>
-                      <div style="display:flex; align-items:flex-end; gap:18px; margin-top:10px;">
-                        <div style="font-size:16px; color:#374151; font-weight:700;">DEBEN HABER</div>
-                        <div style="font-size:86px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
-                        <div style="font-size:20px; color:#374151; font-weight:800; padding-bottom:8px;">UNIDAD(ES)</div>
+                    <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:12px; padding:10px 12px; margin:0 0 6px 0;">
+                      <div style="font-size:11px; font-weight:800; color:#166534; letter-spacing:.04em;">VALIDADO · CONTAR</div>
+                      <div style="font-size:18px; font-weight:900; margin-top:3px; color:#111827; line-height:1.15;">{html.escape(str(pending_title))}</div>
+                      <div style="display:flex; align-items:flex-end; gap:10px; margin-top:4px;">
+                        <div style="font-size:13px; color:#374151; font-weight:800; padding-bottom:6px;">DEBEN HABER</div>
+                        <div style="font-size:56px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
+                        <div style="font-size:14px; color:#374151; font-weight:800; padding-bottom:7px;">UNIDAD(ES)</div>
                       </div>
-                      <div style="font-size:13px; color:#475569; margin-top:10px;">Cuenta físicamente. No escanees unidad por unidad.</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -6631,7 +6630,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 else:
                     st.caption("Sin imagen")
             with right:
-                st.markdown(f"## {title}")
+                st.markdown(f"### {title}")
                 st.caption(f"SKU: {sku}")
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Solicitado", int(qty))
@@ -6740,7 +6739,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     done = _s2_is_sale_done(mid, sale_id)
     # Cierre directo: sin desplegable y sin doble confirmación.
     # El botón solo se habilita cuando todos los productos de la venta están procesados.
-    st.markdown("### 6. Cerrar venta")
+    st.markdown("**Cerrar venta**")
     if st.button(
         "✅ Cerrar venta y volver a escanear etiqueta",
         key=f"s2_close_{sale_id}",
