@@ -6272,18 +6272,19 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     _s2_ensure_items_schema_runtime()
 
-    # UI compacta para PDA: menos espacio vertical, scanner y mesa arriba.
     st.markdown("""
     <style>
-      .block-container { padding-top: 0.35rem !important; padding-bottom: 0.5rem !important; }
-      div[data-testid="stVerticalBlock"] { gap: 0.35rem !important; }
-      div[data-testid="stHorizontalBlock"] { gap: 0.5rem !important; }
-      h1, h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.25rem !important; }
-      [data-testid="stMetric"] { padding: 0rem !important; }
-      [data-testid="stMetricValue"] { font-size: 1.25rem !important; }
-      .stButton > button { min-height: 2.15rem !important; padding-top: 0.25rem !important; padding-bottom: 0.25rem !important; }
+    /* Compactación específica para Camarero/PDA */
+    .block-container {padding-top: 0.6rem !important; padding-bottom: 0.6rem !important;}
+    div[data-testid="stVerticalBlock"] > div {gap: 0.35rem;}
+    div[data-testid="stHorizontalBlock"] {gap: 0.55rem;}
+    .stTextInput input {height: 2.35rem !important; font-size: 0.95rem !important;}
+    .stNumberInput input {height: 2.35rem !important;}
+    button[kind="secondary"], .stButton button {min-height: 2.15rem !important; padding-top: 0.25rem !important; padding-bottom: 0.25rem !important;}
+    h1, h2, h3 {margin-top: 0.2rem !important; margin-bottom: 0.25rem !important;}
     </style>
     """, unsafe_allow_html=True)
+    st.markdown("### Camarero")
 
     # Estado base
     if "s2_sale_open" not in st.session_state:
@@ -6295,9 +6296,9 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         st.session_state[pending_qty_key] = 0
         st.session_state[pending_title_key] = ""
 
-    # Barra superior compacta: scanner a la izquierda y mesa a la derecha.
-    scanner_col_top, mesa_col_top = st.columns([5, 1])
-    with mesa_col_top:
+    # Selector de mesa compacto arriba
+    _mesa_spacer, _mesa_col = st.columns([5, 1])
+    with _mesa_col:
         mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
     st.session_state["s2_mesa_int"] = int(mesa)
 
@@ -6333,20 +6334,21 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     sale_id = st.session_state.get(sale_key)
 
     # =========================
-    # SCANNER SIEMPRE PRIMERO
+    # 1) SCANNER SIEMPRE PRIMERO
     # =========================
+    st.markdown("**Escanear etiqueta / producto**")
+
     if sale_id is None:
         if st.session_state.get("s2_clear_label_scan"):
             st.session_state["s2_label_scan_widget"] = ""
             st.session_state["s2_clear_label_scan"] = False
 
-        with scanner_col_top:
-            scan = st.text_input(
-                "Escanea etiqueta del envío",
-                key="s2_label_scan_widget",
-                placeholder="Escanea etiqueta / envío",
-                label_visibility="collapsed",
-            )
+        scan = st.text_input(
+            "Escanea etiqueta del envío",
+            key="s2_label_scan_widget",
+            placeholder="Escanea QR Flex o barra Colecta",
+            label_visibility="collapsed",
+        )
         autofocus_input("Escanea etiqueta del envío")
 
         if scan:
@@ -6422,7 +6424,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                             st.error(f"No encontré esta etiqueta en los manifiestos. Próxima esperada para Mesa {int(mesa)}: `{exp_id}` · Página {expected_page}.")
                         sfx_emit("ERR")
 
-
+    
     else:
         # Limpieza segura del campo de producto
         if st.session_state.get("s2_clear_prod_scan"):
@@ -6430,14 +6432,13 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             st.session_state["s2_clear_prod_scan"] = False
 
         pending_sku = st.session_state.get(pending_sku_key)
-        with scanner_col_top:
-            sku_scan = st.text_input(
-                "Escanea producto",
-                key="s2_prod_scan_widget",
-                placeholder="Escanea EAN / SKU",
-                disabled=bool(pending_sku),
-                label_visibility="collapsed",
-            )
+        sku_scan = st.text_input(
+            "Escanea producto",
+            key="s2_prod_scan_widget",
+            placeholder="Escanea EAN / SKU del producto",
+            disabled=bool(pending_sku),
+            label_visibility="collapsed",
+        )
         autofocus_input("Escanea producto")
 
         sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
@@ -6529,8 +6530,10 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     next_item = _s2_next_pending_item(mid, sale_id)
 
     # =========================
-    # PRODUCTO ACTUAL: compacto para PDA
+    # 2) PRODUCTO ACTUAL SEGUNDO
     # =========================
+    st.markdown("**Producto actual**")
+
     pending_sku = st.session_state.get(pending_sku_key)
     if pending_sku:
         pending_qty = int(st.session_state.get(pending_qty_key, 0) or 0)
@@ -6544,7 +6547,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
         validated_card = st.container(border=True)
         with validated_card:
-            img_col, info_col = st.columns([1, 4])
+            img_col, info_col = st.columns([1, 5])
             with img_col:
                 st.markdown(" ")
                 if pending_pics:
@@ -6556,11 +6559,11 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     f"""
                     <div style="border:2px solid #22c55e; background:#ecfdf5; border-radius:12px; padding:10px 12px; margin:0 0 6px 0;">
                       <div style="font-size:11px; font-weight:800; color:#166534; letter-spacing:.04em;">VALIDADO · CONTAR</div>
-                      <div style="font-size:19px; font-weight:900; margin-top:2px; color:#111827; line-height:1.15;">{html.escape(str(pending_title))}</div>
+                      <div style="font-size:18px; font-weight:900; margin-top:3px; color:#111827; line-height:1.15;">{html.escape(str(pending_title))}</div>
                       <div style="display:flex; align-items:flex-end; gap:10px; margin-top:4px;">
                         <div style="font-size:13px; color:#374151; font-weight:800; padding-bottom:6px;">DEBEN HABER</div>
-                        <div style="font-size:54px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
-                        <div style="font-size:15px; color:#374151; font-weight:800; padding-bottom:6px;">UNID.</div>
+                        <div style="font-size:56px; line-height:.9; font-weight:900; color:#0f172a;">{pending_qty}</div>
+                        <div style="font-size:14px; color:#374151; font-weight:800; padding-bottom:7px;">UNIDAD(ES)</div>
                       </div>
                     </div>
                     """,
@@ -6637,7 +6640,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 else:
                     st.caption("Sin imagen")
             with right:
-                st.markdown(f"<div style='font-size:20px;font-weight:900;line-height:1.15'>{html.escape(str(title))}</div>", unsafe_allow_html=True)
+                st.markdown(f"### {title}")
                 st.caption(f"SKU: {sku}")
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Solicitado", int(qty))
@@ -6746,6 +6749,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     done = _s2_is_sale_done(mid, sale_id)
     # Cierre directo: sin desplegable y sin doble confirmación.
     # El botón solo se habilita cuando todos los productos de la venta están procesados.
+    st.markdown("**Cerrar venta**")
     if st.button(
         "✅ Cerrar venta y volver a escanear etiqueta",
         key=f"s2_close_{sale_id}",
@@ -6762,7 +6766,8 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         st.session_state["s2_clear_prod_scan"] = True
         st.session_state["s2_clear_label_scan"] = True
         st.rerun()
-
+    if not done:
+        st.info("Para cerrar: procesa todos los productos de la venta. Puedes marcar Completo, Faltante o Sin EAN según corresponda.")
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
