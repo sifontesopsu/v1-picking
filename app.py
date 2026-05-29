@@ -4114,6 +4114,109 @@ def _s2_now_iso():
         return datetime.now(CL_TZ).isoformat(timespec="seconds")
     return datetime.now().isoformat(timespec="seconds")
 
+
+def _s2_ensure_items_schema_runtime():
+    """Normaliza s2_items en tiempo de ejecución.
+
+    Esto evita errores en Streamlit Cloud cuando queda una base antigua con columnas
+    distintas a las que usa el Camarero. La función es idempotente y segura:
+    crea una tabla nueva con el esquema correcto, copia lo recuperable y reemplaza.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
+            manifest_id INTEGER NOT NULL,
+            sale_id TEXT NOT NULL,
+            sku TEXT NOT NULL,
+            description TEXT,
+            qty INTEGER NOT NULL DEFAULT 0,
+            picked INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            confirm_mode TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (manifest_id, sale_id, sku)
+        );""")
+        conn.commit()
+
+        cols = [r[1] for r in c.execute("PRAGMA table_info(s2_items);").fetchall()]
+        required = {"manifest_id", "sale_id", "sku", "description", "qty", "picked", "status"}
+        if required.issubset(set(cols)):
+            if "confirm_mode" not in cols:
+                c.execute("ALTER TABLE s2_items ADD COLUMN confirm_mode TEXT;")
+            if "updated_at" not in cols:
+                c.execute("ALTER TABLE s2_items ADD COLUMN updated_at TEXT;")
+            c.execute("UPDATE s2_items SET picked=0 WHERE picked IS NULL;")
+            c.execute("UPDATE s2_items SET status='PENDING' WHERE status IS NULL OR status='';")
+            conn.commit()
+            return True
+
+        old_cols = list(cols)
+        c.execute("DROP TABLE IF EXISTS s2_items_runtime_new;")
+        c.execute("""CREATE TABLE s2_items_runtime_new (
+            manifest_id INTEGER NOT NULL,
+            sale_id TEXT NOT NULL,
+            sku TEXT NOT NULL,
+            description TEXT,
+            qty INTEGER NOT NULL DEFAULT 0,
+            picked INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            confirm_mode TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (manifest_id, sale_id, sku)
+        );""")
+
+        def pick(*names, default="NULL"):
+            for name in names:
+                if name in old_cols:
+                    return name
+            return default
+
+        src_manifest = pick("manifest_id", "mid", default="0")
+        src_sale = pick("sale_id", "venta_id", "order_id", "ml_order_id", default="''")
+        src_sku = pick("sku", "sku_ml", "codigo_sku", default="''")
+        src_desc = pick("description", "descripcion", "title_ml", "title", "producto", default="''")
+        src_qty = pick("qty", "cantidad", "qty_total", "unidades", default="0")
+        src_picked = pick("picked", "qty_picked", "verificado", default="0")
+        src_status = pick("status", "estado", default="'PENDING'")
+        src_confirm = pick("confirm_mode", default="NULL")
+        src_updated = pick("updated_at", default="NULL")
+
+        c.execute(f"""
+            INSERT OR IGNORE INTO s2_items_runtime_new(manifest_id, sale_id, sku, description, qty, picked, status, confirm_mode, updated_at)
+            SELECT
+                COALESCE(CAST({src_manifest} AS INTEGER), 0),
+                COALESCE(CAST({src_sale} AS TEXT), ''),
+                COALESCE(CAST({src_sku} AS TEXT), ''),
+                COALESCE(CAST({src_desc} AS TEXT), ''),
+                COALESCE(CAST({src_qty} AS INTEGER), 0),
+                COALESCE(CAST({src_picked} AS INTEGER), 0),
+                COALESCE(CAST({src_status} AS TEXT), 'PENDING'),
+                {src_confirm},
+                {src_updated}
+            FROM s2_items
+            WHERE COALESCE(CAST({src_sku} AS TEXT), '') <> '';
+        """)
+        c.execute("DROP TABLE IF EXISTS s2_items_old_broken;")
+        c.execute("ALTER TABLE s2_items RENAME TO s2_items_old_broken;")
+        c.execute("ALTER TABLE s2_items_runtime_new RENAME TO s2_items;")
+        c.execute("DROP TABLE IF EXISTS s2_items_old_broken;")
+        c.execute("UPDATE s2_items SET picked=0 WHERE picked IS NULL;")
+        c.execute("UPDATE s2_items SET status='PENDING' WHERE status IS NULL OR status='';")
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def _s2_create_tables():
     conn = get_conn()
     c = conn.cursor()
@@ -4190,13 +4293,71 @@ def _s2_create_tables():
     except Exception:
         pass
 
-    # s2_items: guardar confirm_mode para trazabilidad (ej: MANUAL_NO_EAN)
+    # s2_items: migración robusta para BD antiguas de Streamlit Cloud.
+    # Algunas corridas anteriores dejaron s2_items con columnas incompletas; si no normalizamos,
+    # Camarero falla al consultar sku/description/qty/picked/status.
     try:
         cols_i = [r[1] for r in c.execute("PRAGMA table_info(s2_items);").fetchall()]
-        if "confirm_mode" not in cols_i:
-            c.execute("ALTER TABLE s2_items ADD COLUMN confirm_mode TEXT;")
-        if "updated_at" not in cols_i:
-            c.execute("ALTER TABLE s2_items ADD COLUMN updated_at TEXT;")
+        sql_i_row = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='s2_items';").fetchone()
+        sql_i = (sql_i_row[0] if sql_i_row and sql_i_row[0] else "")
+        required_i = {"manifest_id", "sale_id", "sku", "description", "qty", "picked", "status"}
+        has_required = required_i.issubset(set(cols_i))
+        has_pk = "PRIMARY KEY (manifest_id, sale_id, sku)" in sql_i.replace("\n", " ")
+
+        if (not has_required) or (not has_pk):
+            old_cols_i = list(cols_i)
+            c.execute("ALTER TABLE s2_items RENAME TO s2_items_old_migration;")
+            c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
+                manifest_id INTEGER NOT NULL,
+                sale_id TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                description TEXT,
+                qty INTEGER NOT NULL DEFAULT 0,
+                picked INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                confirm_mode TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (manifest_id, sale_id, sku)
+            );""")
+
+            # Copiar lo recuperable desde nombres antiguos o alternativos.
+            src_manifest = "manifest_id" if "manifest_id" in old_cols_i else "NULL"
+            src_sale = "sale_id" if "sale_id" in old_cols_i else ("venta_id" if "venta_id" in old_cols_i else "''")
+            src_sku = "sku" if "sku" in old_cols_i else ("sku_ml" if "sku_ml" in old_cols_i else "''")
+            src_desc = "description" if "description" in old_cols_i else ("title_ml" if "title_ml" in old_cols_i else ("title_tec" if "title_tec" in old_cols_i else "''"))
+            src_qty = "qty" if "qty" in old_cols_i else ("qty_total" if "qty_total" in old_cols_i else "0")
+            src_picked = "picked" if "picked" in old_cols_i else ("qty_picked" if "qty_picked" in old_cols_i else "0")
+            src_status = "status" if "status" in old_cols_i else "'PENDING'"
+            src_confirm = "confirm_mode" if "confirm_mode" in old_cols_i else "NULL"
+            src_updated = "updated_at" if "updated_at" in old_cols_i else "NULL"
+
+            c.execute(f"""
+                INSERT OR IGNORE INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status, confirm_mode, updated_at)
+                SELECT
+                    COALESCE({src_manifest}, 0),
+                    COALESCE(CAST({src_sale} AS TEXT), ''),
+                    COALESCE(CAST({src_sku} AS TEXT), ''),
+                    CAST({src_desc} AS TEXT),
+                    COALESCE(CAST({src_qty} AS INTEGER), 0),
+                    COALESCE(CAST({src_picked} AS INTEGER), 0),
+                    COALESCE(CAST({src_status} AS TEXT), 'PENDING'),
+                    {src_confirm},
+                    {src_updated}
+                FROM s2_items_old_migration
+                WHERE COALESCE(CAST({src_sku} AS TEXT), '') <> '';
+            """)
+            c.execute("DROP TABLE IF EXISTS s2_items_old_migration;")
+        else:
+            if "confirm_mode" not in cols_i:
+                c.execute("ALTER TABLE s2_items ADD COLUMN confirm_mode TEXT;")
+            if "updated_at" not in cols_i:
+                c.execute("ALTER TABLE s2_items ADD COLUMN updated_at TEXT;")
+            if "picked" not in cols_i:
+                c.execute("ALTER TABLE s2_items ADD COLUMN picked INTEGER NOT NULL DEFAULT 0;")
+            if "status" not in cols_i:
+                c.execute("ALTER TABLE s2_items ADD COLUMN status TEXT NOT NULL DEFAULT 'PENDING';")
+        c.execute("UPDATE s2_items SET picked=0 WHERE picked IS NULL;")
+        c.execute("UPDATE s2_items SET status='PENDING' WHERE status IS NULL OR status='';")
     except Exception:
         pass
 
@@ -5637,16 +5798,121 @@ def _s2_next_pending_sale_in_sequence(mid:int, mesa:int):
     return row  # (sale_id, shipment_id, pack_id, page_no) o None
 
 
+
+def _s2_table_columns(table: str) -> set:
+    conn = get_conn()
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table});").fetchall()}
+    except Exception:
+        return set()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _s2_pick_col(cols: set, *names: str, default_sql: str = "NULL") -> str:
+    """Devuelve una expresión SQL segura para columnas antiguas/nuevas."""
+    for name in names:
+        if name in cols:
+            return '"' + name.replace('"', '""') + '"'
+    return default_sql
+
+def _s2_next_pending_item(mid:int, sale_id:str):
+    """Devuelve el próximo producto pendiente de una venta sin asumir esquema fijo.
+
+    Motivo: en Streamlit Cloud puede existir una DB antigua donde s2_items no trae
+    exactamente sku/description/qty/picked/status. Esta consulta detecta columnas
+    disponibles y usa equivalentes o valores por defecto, evitando OperationalError.
+    """
+    try:
+        _s2_ensure_items_schema_runtime()
+    except Exception:
+        pass
+
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        cols = {str(r[1]) for r in c.execute("PRAGMA table_info(s2_items);").fetchall()}
+        if not cols:
+            return None
+
+        col_mid = _s2_pick_col(cols, "manifest_id", "mid", default_sql="NULL")
+        col_sale = _s2_pick_col(cols, "sale_id", "venta_id", "order_id", "ml_order_id", default_sql="NULL")
+        col_sku = _s2_pick_col(cols, "sku", "sku_ml", "codigo_sku", default_sql="NULL")
+        col_desc = _s2_pick_col(cols, "description", "descripcion", "title_ml", "title_tec", "title", "producto", default_sql="''")
+        col_qty = _s2_pick_col(cols, "qty", "cantidad", "qty_total", "unidades", default_sql="0")
+        col_picked = _s2_pick_col(cols, "picked", "qty_picked", "verificado", default_sql="0")
+        col_status = _s2_pick_col(cols, "status", "estado", default_sql="'PENDING'")
+
+        if col_mid == "NULL" or col_sale == "NULL" or col_sku == "NULL":
+            return None
+
+        sql = f"""
+            SELECT
+                CAST({col_sku} AS TEXT) AS sku,
+                CAST({col_desc} AS TEXT) AS description,
+                COALESCE(CAST({col_qty} AS INTEGER), 0) AS qty,
+                COALESCE(CAST({col_picked} AS INTEGER), 0) AS picked,
+                COALESCE(CAST({col_status} AS TEXT), 'PENDING') AS status
+            FROM s2_items
+            WHERE CAST({col_mid} AS INTEGER)=?
+              AND CAST({col_sale} AS TEXT)=?
+              AND COALESCE(CAST({col_sku} AS TEXT), '') <> ''
+              AND COALESCE(CAST({col_status} AS TEXT), 'PENDING') NOT IN ('DONE','INCIDENCE')
+            ORDER BY sku
+            LIMIT 1;
+        """
+        return c.execute(sql, (int(mid), str(sale_id))).fetchone()
+    except sqlite3.OperationalError:
+        # Último seguro: no botar la app. La mesa queda sin ítem hasta recargar/manifiesto nuevo.
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _s2_sale_items(mid:int, sale_id:str):
+    try:
+        _s2_ensure_items_schema_runtime()
+    except Exception:
+        pass
     conn=get_conn()
     c=conn.cursor()
-    c.execute("""SELECT sku, description, qty, picked, status
-                 FROM s2_items WHERE manifest_id=? AND sale_id=? ORDER BY sku;""", (mid, sale_id))
-    rows=c.fetchall()
-    conn.close()
-    return rows
+    try:
+        cols = {str(r[1]) for r in c.execute("PRAGMA table_info(s2_items);").fetchall()}
+        if not cols:
+            return []
+        col_mid = _s2_pick_col(cols, "manifest_id", "mid", default_sql="NULL")
+        col_sale = _s2_pick_col(cols, "sale_id", "venta_id", "order_id", "ml_order_id", default_sql="NULL")
+        col_sku = _s2_pick_col(cols, "sku", "sku_ml", "codigo_sku", default_sql="NULL")
+        col_desc = _s2_pick_col(cols, "description", "descripcion", "title_ml", "title_tec", "title", "producto", default_sql="''")
+        col_qty = _s2_pick_col(cols, "qty", "cantidad", "qty_total", "unidades", default_sql="0")
+        col_picked = _s2_pick_col(cols, "picked", "qty_picked", "verificado", default_sql="0")
+        col_status = _s2_pick_col(cols, "status", "estado", default_sql="'PENDING'")
+        if col_mid == "NULL" or col_sale == "NULL" or col_sku == "NULL":
+            return []
+        sql = f"""
+            SELECT CAST({col_sku} AS TEXT) AS sku,
+                   CAST({col_desc} AS TEXT) AS description,
+                   COALESCE(CAST({col_qty} AS INTEGER), 0) AS qty,
+                   COALESCE(CAST({col_picked} AS INTEGER), 0) AS picked,
+                   COALESCE(CAST({col_status} AS TEXT), 'PENDING') AS status
+            FROM s2_items
+            WHERE CAST({col_mid} AS INTEGER)=? AND CAST({col_sale} AS TEXT)=?
+            ORDER BY sku;
+        """
+        return c.execute(sql, (int(mid), str(sale_id))).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
 
 def _s2_apply_pick(mid:int, sale_id:str, sku:str, add_qty:int):
+    _s2_ensure_items_schema_runtime()
     conn=get_conn()
     c=conn.cursor()
     c.execute("""SELECT qty, picked FROM s2_items
@@ -5667,6 +5933,7 @@ def _s2_apply_pick(mid:int, sale_id:str, sku:str, add_qty:int):
 
 
 def _s2_mark_incidence(mid:int, sale_id:str, sku:str, note:str=""):
+    _s2_ensure_items_schema_runtime()
     conn=get_conn()
     c=conn.cursor()
     c.execute("UPDATE s2_items SET status='INCIDENCE', confirm_mode='INCIDENCE', updated_at=? WHERE manifest_id=? AND sale_id=? AND sku=?;", (_s2_now_iso(), mid, sale_id, sku))
@@ -5674,6 +5941,7 @@ def _s2_mark_incidence(mid:int, sale_id:str, sku:str, note:str=""):
     conn.close()
 
 def _s2_force_done_no_ean(mid:int, sale_id:str, sku:str):
+    _s2_ensure_items_schema_runtime()
     conn=get_conn()
     c=conn.cursor()
     c.execute("SELECT qty, picked FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
@@ -5701,110 +5969,6 @@ def _s2_close_sale(mid:int, sale_id:str):
     c.execute("""UPDATE s2_sales SET status='DONE', closed_at=? WHERE manifest_id=? AND sale_id=?;""", (_s2_now_iso(), mid, sale_id))
     conn.commit()
     conn.close()
-
-
-
-def _s2_mesa_labels_summary(mid: int, mesa: int) -> list[dict]:
-    """Lista compacta de etiquetas/ventas asignadas a una mesa."""
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("""
-        SELECT sale_id, shipment_id, pack_id, page_no, row_no, status, customer
-        FROM s2_sales
-        WHERE manifest_id=? AND mesa=?
-        ORDER BY page_no, row_no, sale_id;
-    """, (int(mid), int(mesa))).fetchall()
-    conn.close()
-    out = []
-    for sale_id, shipment_id, pack_id, page_no, row_no, status, customer in rows:
-        out.append({
-            "Página": int(page_no or 0),
-            "Orden": int(row_no or 0),
-            "Venta": str(sale_id or ""),
-            "Etiqueta/Envío": str(shipment_id or pack_id or ""),
-            "Cliente": str(customer or ""),
-            "Estado": str(status or ""),
-        })
-    return out
-
-
-def _s2_find_label_location(scan_or_sid: str) -> list[dict]:
-    """Busca una etiqueta en todos los lotes activos y devuelve mesa/lote/página."""
-    _s2_migrate_staged_to_active()
-    _s2_create_tables()
-    sid = _s2_extract_shipment_id(scan_or_sid) or str(scan_or_sid or "").strip()
-    if not sid:
-        return []
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute("""
-        SELECT s.manifest_id, s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.status, m.created_at
-        FROM s2_sales s
-        JOIN s2_manifests m ON m.id = s.manifest_id
-        LEFT JOIN s2_mesa_status ms ON ms.manifest_id = s.manifest_id AND ms.mesa = s.mesa
-        WHERE m.status='ACTIVE'
-          AND COALESCE(ms.status, 'OPEN')='OPEN'
-          AND (s.shipment_id=? OR s.pack_id=? OR s.sale_id=?)
-        ORDER BY s.manifest_id DESC, s.page_no, s.row_no
-        LIMIT 20;
-    """, (str(sid), str(sid), str(sid))).fetchall()
-    conn.close()
-    out = []
-    for mid, sale_id, shipment_id, pack_id, page_no, mesa, status, created_at in rows:
-        out.append({
-            "manifest_id": int(mid),
-            "lote": _s2_lot_label(int(mid)),
-            "venta": str(sale_id or ""),
-            "envio": str(shipment_id or pack_id or sid),
-            "pagina": int(page_no or 0),
-            "mesa": int(mesa or 0),
-            "estado": str(status or ""),
-        })
-    return out
-
-
-def _s2_next_pending_item(mid: int, sale_id: str):
-    """Devuelve el próximo producto pendiente de la venta para trabajar producto por producto.
-
-    Corrección: s2_items NO tiene columna id en el esquema actual; usa rowid/sku para no caer con
-    sqlite3.OperationalError: no such column: id.
-    """
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        row = c.execute("""
-            SELECT sku, description, qty, picked, status
-            FROM s2_items
-            WHERE manifest_id=? AND sale_id=? AND COALESCE(status,'PENDING')='PENDING'
-            ORDER BY rowid, sku
-            LIMIT 1;
-        """, (int(mid), str(sale_id))).fetchone()
-    except sqlite3.OperationalError:
-        try:
-            row = c.execute("""
-                SELECT sku, description, qty, picked, status
-                FROM s2_items
-                WHERE manifest_id=? AND sale_id=? AND COALESCE(status,'PENDING')='PENDING'
-                ORDER BY sku
-                LIMIT 1;
-            """, (int(mid), str(sale_id))).fetchone()
-        except sqlite3.OperationalError:
-            row = None
-    conn.close()
-    return row
-
-def _s2_title_for_sku(inv_map_sku, sku: str, fallback: str = "") -> str:
-    title = ""
-    if isinstance(inv_map_sku, dict):
-        k = str(sku).strip()
-        title = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
-        if not title and k.isdigit():
-            try:
-                title = inv_map_sku.get(str(int(k))) or ""
-            except Exception:
-                pass
-    return title or fallback or str(sku)
 
 
 def page_sorting_upload(inv_map_sku, barcode_to_sku):
@@ -6071,13 +6235,14 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
 
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
+    _s2_ensure_items_schema_runtime()
     st.title("Camarero")
-    st.caption("Escaneo por etiqueta y verificación producto por producto")
+    st.caption("Escaneo por etiqueta (Flex/Colecta) y productos por SKU/EAN")
 
     mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
-    mesa = int(mesa)
-    st.session_state["s2_mesa_int"] = mesa
+    st.session_state["s2_mesa_int"] = int(mesa)  # store separately; do not overwrite widget key
 
+    # State: current sale
     if "s2_sale_open" not in st.session_state:
         st.session_state["s2_sale_open"] = None
     if "s2_sale_open_manifest_id" not in st.session_state:
@@ -6086,50 +6251,38 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     if st.session_state["s2_sale_open"] is not None and st.session_state.get("s2_sale_open_manifest_id"):
         mid = int(st.session_state["s2_sale_open_manifest_id"])
     else:
-        mid = _s2_find_manifest_by_mesa(mesa)
+        mid = _s2_find_manifest_by_mesa(int(mesa))
         if not mid:
-            st.warning(f"La mesa {mesa} no está asignada a ningún manifiesto abierto.")
+            st.warning(f"La mesa {int(mesa)} no está asignada a ningún manifiesto abierto.")
             return
-
     st.session_state["sorting_manifest_id"] = mid
-    lot_label = _s2_lot_label(mid)
-    st.caption(f"Lote detectado para esta mesa: {lot_label}")
+    st.caption(f"Lote detectado para esta mesa: {_s2_lot_label(mid)}")
 
-    if _s2_is_mesa_closed(mid, mesa):
-        st.success(f"La mesa {mesa} ya fue cerrada en camarero.")
+    if _s2_is_mesa_closed(mid, int(mesa)):
+        st.success(f"La mesa {int(mesa)} ya fue cerrada en camarero.")
         return
 
-    # Siempre mostrar las etiquetas/ventas asignadas a la mesa, comprimidas.
-    labels_summary = _s2_mesa_labels_summary(mid, mesa)
-    pending_labels = [r for r in labels_summary if str(r.get("Estado", "")).upper() != "DONE"]
-    with st.expander(f"🏷️ Etiquetas asignadas a Mesa {mesa} · {len(pending_labels)} pendientes / {len(labels_summary)} total", expanded=True):
-        if labels_summary:
-            st.dataframe(labels_summary, use_container_width=True, hide_index=True)
-        else:
-            st.info("Esta mesa no tiene etiquetas asignadas.")
-
-    # Sin venta abierta: la barra de scanner queda al principio.
     if st.session_state["s2_sale_open"] is None:
-        st.subheader("Escanear etiqueta")
+        st.subheader("Escanea etiqueta (QR Flex o barra Colecta)")
+        # Limpieza segura del campo de escaneo (evita StreamlitAPIException)
         if st.session_state.get("s2_clear_label_scan"):
             st.session_state["s2_label_scan_widget"] = ""
             st.session_state["s2_clear_label_scan"] = False
 
         scan = st.text_input("Etiqueta", key="s2_label_scan_widget")
-        autofocus_input("Etiqueta")
-
         if scan:
             sid = _s2_extract_shipment_id(scan)
             if not sid:
                 st.error("No pude leer el ID de envío desde el escaneo.")
                 sfx_emit("ERR")
             else:
-                nxt = _s2_next_pending_sale_in_sequence(mid, mesa)
+                # Secuencia obligatoria: solo se puede abrir la PRÓXIMA venta pendiente según manifiesto (página -> venta)
+                nxt = _s2_next_pending_sale_in_sequence(mid, int(mesa))
                 if not nxt:
                     st.success("No hay más ventas pendientes en esta mesa.")
                     close_cols = st.columns([1, 1])
-                    if close_cols[0].button("🔒 Cerrar mesa", key=f"s2_close_mesa_btn_{mid}_{mesa}", use_container_width=True):
-                        ok_close, err_close = _s2_close_mesa(mid, mesa)
+                    if close_cols[0].button("🔒 Cerrar mesa", key=f"s2_close_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
+                        ok_close, err_close = _s2_close_mesa(mid, int(mesa))
                         if ok_close:
                             sfx_emit("OK")
                             st.session_state["s2_clear_label_scan"] = True
@@ -6137,59 +6290,53 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                         else:
                             st.error(err_close or "No se pudo cerrar la mesa.")
                             sfx_emit("ERR")
-                    if close_cols[1].button("↻ Refrescar", key=f"s2_refresh_mesa_btn_{mid}_{mesa}", use_container_width=True):
+                    if close_cols[1].button("↻ Refrescar", key=f"s2_refresh_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
                         st.session_state["s2_clear_label_scan"] = True
                         st.rerun()
                     return
-
                 expected_sale_id, expected_ship, expected_pack, expected_page = nxt
                 sale_id = None
                 if sid and expected_ship and str(sid) == str(expected_ship):
                     sale_id = expected_sale_id
                 elif sid and expected_pack and str(sid) == str(expected_pack):
                     sale_id = expected_sale_id
-
                 if not sale_id:
-                    locations = _s2_find_label_location(sid)
-                    same_lot = [x for x in locations if int(x["manifest_id"]) == int(mid)]
-                    same_mesa = [x for x in same_lot if int(x["mesa"]) == int(mesa)]
-
-                    if same_mesa:
-                        exp_id = str(expected_ship or expected_pack or "")
-                        st.error(
-                            f"Etiqueta de esta mesa, pero fuera de secuencia. Próxima página: {expected_page}. "
-                            f"ID esperado: {exp_id}."
-                        )
-                    elif locations:
-                        loc = locations[0]
-                        st.error(
-                            f"Etiqueta no corresponde a la mesa {mesa}. Pertenece a {loc['lote']}, "
-                            f"Mesa {loc['mesa']}, Página {loc['pagina']}, Venta {loc['venta']}."
-                        )
-                        with st.expander("Ver otras coincidencias", expanded=False):
-                            st.dataframe(locations, use_container_width=True, hide_index=True)
+                    # Existe en el manifiesto pero NO es la siguiente venta => bloquear por secuencia
+                    conn=get_conn(); c=conn.cursor()
+                    c.execute("""SELECT mesa, page_no, status, shipment_id, pack_id
+                                 FROM s2_sales
+                                 WHERE manifest_id=? AND (shipment_id=? OR pack_id=?)
+                                 LIMIT 10;""", (mid, sid, sid))
+                    info=c.fetchall(); conn.close()
+                    if info:
+                        # ¿Está en esta mesa?
+                        in_same_mesa = [r for r in info if int(r[0] or 0) == int(mesa)]
+                        if in_same_mesa:
+                            exp_id = str(expected_ship or expected_pack or "")
+                            st.error(f"Secuencia obligatoria: la próxima venta de esta mesa es de la página {expected_page}.\n\nDebes escanear la siguiente etiqueta del manifiesto (ID esperado: {exp_id}).")
+                            sfx_emit("ERR")
+                        else:
+                            st.warning(f"Etiqueta encontrada, pero corresponde a otra mesa/página: {[(r[0], r[1], r[2]) for r in info]}")
+                            sfx_emit("ERR")
                     else:
-                        st.error("No encontré esta etiqueta en ningún lote activo abierto.")
-                    sfx_emit("ERR")
+                        st.error("No encontré esta etiqueta en corridas del manifiesto activo.")
+                        sfx_emit("ERR")
                 else:
                     st.session_state["s2_sale_open"] = sale_id
                     st.session_state["s2_sale_open_manifest_id"] = mid
                     st.session_state["s2_clear_label_scan"] = True
-                    st.session_state["s2_pending_sku"] = None
-                    st.session_state["s2_pending_qty"] = 0
-                    st.session_state["s2_pending_title"] = ""
                     sfx_emit("OK")
                     st.rerun()
         return
 
     sale_id = st.session_state["s2_sale_open"]
+    st.info(f"Venta abierta: {sale_id}")
 
-    conn = get_conn()
-    c = conn.cursor()
-    sale_row = c.execute("""SELECT shipment_id, pack_id, customer, destino, comuna, ciudad_destino, page_no, mesa, status
-                            FROM s2_sales WHERE manifest_id=? AND sale_id=?;""", (mid, sale_id)).fetchone()
+
+    # Información de la etiqueta / envío
+    conn=get_conn(); c=conn.cursor()
+    sale_row = c.execute("SELECT shipment_id, pack_id, customer, destino, comuna, ciudad_destino, page_no, mesa, status FROM s2_sales WHERE manifest_id=? AND sale_id=?;", (mid, sale_id)).fetchone()
     conn.close()
-
     shipment_id = sale_row[0] if sale_row else ""
     pack_id = sale_row[1] if sale_row else ""
     customer = sale_row[2] if sale_row else ""
@@ -6197,41 +6344,90 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     comuna_db = sale_row[4] if sale_row else ""
     ciudad_dest_db = sale_row[5] if sale_row else ""
     page_no = sale_row[6] if sale_row else ""
-    mesa_db = sale_row[7] if sale_row else mesa
-
-    st.success(f"Venta abierta: {sale_id} · Mesa {mesa_db} · Página {page_no or '-'}")
+    mesa_db = sale_row[7] if sale_row else ""
 
     raw_label = _s2_get_label_raw(mid, shipment_id) if shipment_id else ""
     info = _s2_parse_label_raw_info(raw_label)
+
+    st.markdown("### Etiqueta / Envío")
+    a,b,cx = st.columns(3)
+    a.metric("Envío", str(shipment_id) if shipment_id else "-")
+    b.metric("Pack ID", str(pack_id) if pack_id else "-")
+    cx.metric("Mesa / Página", f"{mesa_db}/{page_no}" if page_no else str(mesa_db))
+
+    # Datos de destino / cliente (desde etiqueta si existe; fallback a DB)
     name = (info.get("destinatario") or customer or "-").strip() if isinstance(info, dict) else (customer or "-")
     dom = (info.get("domicilio") or info.get("direccion") or destino_db or "-").strip() if isinstance(info, dict) else (destino_db or "-")
     comuna = (info.get("comuna") or comuna_db or "-").strip() if isinstance(info, dict) else (comuna_db or "-")
     ciudad_dest = (info.get("ciudad_destino") or ciudad_dest_db or "-").strip() if isinstance(info, dict) else (ciudad_dest_db or "-")
 
-    with st.expander("Información etiqueta / cliente", expanded=False):
-        a, b, cx = st.columns(3)
-        a.metric("Envío", str(shipment_id) if shipment_id else "-")
-        b.metric("Pack ID", str(pack_id) if pack_id else "-")
-        cx.metric("Mesa / Página", f"{mesa_db}/{page_no}" if page_no else str(mesa_db))
-        st.write(f"**Cliente:** {name}")
-        if dom and dom != "-":
-            st.write(f"**Domicilio:** {dom}")
-        if comuna and comuna != "-":
-            st.write(f"**Comuna:** {comuna}")
-        if ciudad_dest and ciudad_dest != "-":
-            st.write(f"**Ciudad destino:** {ciudad_dest}")
-
-    # Producto por producto: solo se muestra el siguiente pendiente.
+    # Presentación compacta
+    st.write(f"**Cliente:** {name}")
+    if dom and dom != "-":
+        st.write(f"**Domicilio:** {dom}")
+    # FLEX: mostrar Comuna + Ciudad/Región (si vienen). COLECTA: ciudad_destino suele venir siempre.
+    if comuna and comuna != "-":
+        st.write(f"**Comuna:** {comuna}")
+    if ciudad_dest and ciudad_dest != "-":
+        st.write(f"**Ciudad destino:** {ciudad_dest}")
     items = _s2_sale_items(mid, sale_id)
+
+    st.markdown("### Productos de la venta")
     total_items = len(items)
-    done_items = sum(1 for _sku, _d, _q, _p, stx in items if stx in ("DONE", "INCIDENCE"))
-    st.progress(0 if total_items == 0 else done_items / total_items)
-    st.caption(f"Avance venta: {done_items}/{total_items} productos finalizados")
+    done_items = sum(1 for _sku,_d,_q,_p,stx in items if stx in ("DONE","INCIDENCE"))
+    st.progress(0 if total_items==0 else done_items/total_items)
+    st.caption(f"{done_items}/{total_items} ítems finalizados (DONE o INCIDENCE)")
 
-    next_item = _s2_next_pending_item(mid, sale_id)
+    for sku, desc, qty, picked, status in items:
+        title = None
+        if isinstance(inv_map_sku, dict):
+            k = str(sku).strip()
+            title = inv_map_sku.get(k)
+            if title is None and k.isdigit():
+                try:
+                    title = inv_map_sku.get(str(int(k)))
+                except Exception:
+                    pass
+        title = title or desc or str(sku)
 
-    # Scanner de producto arriba, antes del detalle visual del producto.
-    st.subheader("Escanear producto")
+        remaining = max(0, int(qty) - int(picked))
+        row1 = st.columns([6, 2, 2])
+        row1[0].markdown(f"### {title}  \nSKU: `{sku}`")
+        row1[1].markdown(f"## {int(qty)}")
+        row1[2].metric("Hecho", int(picked))
+
+        # Imagen (solo bajo demanda para no ocupar espacio)
+        _img_state_key = f"s2_showimg_{sale_id}_{sku}"
+        if _img_state_key not in st.session_state:
+            st.session_state[_img_state_key] = False
+
+        if st.button("🖼️ Ver imagen", key=f"s2_btnimg_{sale_id}_{sku}"):
+            st.session_state[_img_state_key] = not bool(st.session_state.get(_img_state_key, False))
+
+        if st.session_state.get(_img_state_key, False):
+            try:
+                pics, _pub_link = get_picture_urls_for_sku(str(sku))
+            except Exception:
+                pics, _pub_link = [], ""
+            if pics:
+                st.image(pics[0], use_container_width=True)
+            else:
+                st.caption("Sin imagen disponible")
+
+        if status != "DONE" and remaining > 0:
+            bcols = st.columns([1,1,6])
+            if bcols[0].button("⚠️ Incidencia", key=f"s2_inc_{sale_id}_{sku}"):
+                _s2_mark_incidence(mid, sale_id, str(sku))
+                st.rerun()
+            if bcols[1].button("📝 Sin EAN", key=f"s2_noean_{sale_id}_{sku}"):
+                _s2_force_done_no_ean(mid, sale_id, str(sku))
+                st.rerun()
+        st.divider()
+
+    st.subheader("Escanea SKU/EAN del producto")
+    st.caption("Escanea **1 vez**. Luego verificas la cantidad solicitada (sin digitar).")
+
+    # Estado de confirmación por producto
     if "s2_pending_sku" not in st.session_state:
         st.session_state["s2_pending_sku"] = None
         st.session_state["s2_pending_qty"] = 0
@@ -6239,117 +6435,92 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
     pending_sku = st.session_state.get("s2_pending_sku")
 
+    # Limpieza segura del campo de producto (evita StreamlitAPIException)
     if st.session_state.get("s2_clear_prod_scan"):
         st.session_state["s2_prod_scan_widget"] = ""
         st.session_state["s2_clear_prod_scan"] = False
 
-    sku_scan = st.text_input("Producto", key="s2_prod_scan_widget", disabled=bool(pending_sku) or not bool(next_item))
-    autofocus_input("Producto")
+    sku_scan = st.text_input(
+        "Producto",
+        key="s2_prod_scan_widget",
+        disabled=bool(pending_sku)  # mientras confirmas, bloquea nuevo escaneo
+    )
 
-    if next_item:
-        exp_sku, exp_desc, exp_qty, exp_picked, exp_status = next_item
-        exp_remaining = max(0, int(exp_qty or 0) - int(exp_picked or 0))
-        exp_title = _s2_title_for_sku(inv_map_sku, str(exp_sku), exp_desc)
-    else:
-        exp_sku = exp_desc = exp_title = ""
-        exp_remaining = 0
-
+    # 1) Al escanear: identificamos el SKU y preparamos la verificación automática de cantidad pendiente
     sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
-    if sku_scan and not pending_sku and next_item:
-        scanned_sku = resolve_scan_to_sku(sku_scan, barcode_to_sku)
-        if str(scanned_sku) != str(exp_sku):
-            st.error(f"Producto no corresponde. Esperado: {exp_title} · SKU {exp_sku}")
-            st.session_state["s2_clear_prod_scan"] = True
+    if sku_scan and not pending_sku:
+        sku = resolve_scan_to_sku(sku_scan, barcode_to_sku)
+
+        # Buscar qty/picked del ítem dentro de esta venta
+        _s2_ensure_items_schema_runtime()
+        connx = get_conn()
+        cx = connx.cursor()
+        cx.execute(
+            "SELECT qty, picked, description FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;",
+            (mid, sale_id, str(sku))
+        )
+        row = cx.fetchone()
+        connx.close()
+
+        if not row:
+            st.error("SKU/EAN no pertenece a esta venta.")
             sfx_emit("ERR")
-            st.rerun()
         else:
-            st.session_state["s2_pending_sku"] = str(exp_sku)
-            st.session_state["s2_pending_qty"] = int(exp_remaining)
-            st.session_state["s2_pending_title"] = str(exp_title)
-            st.session_state["s2_clear_prod_scan"] = True
-            sfx_emit("OK")
-            st.rerun()
+            qty_req, picked_now, desc_ml = int(row[0]), int(row[1]), row[2]
+            remaining = max(0, qty_req - picked_now)
 
-    if next_item:
-        st.markdown("### Producto actual")
-        st.container(border=True)
-        with st.container(border=True):
-            st.markdown(f"## {exp_title}")
-            st.caption(f"SKU: {exp_sku}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Solicitado", int(exp_qty or 0))
-            c2.metric("Verificado", int(exp_picked or 0))
-            c3.metric("Falta", int(exp_remaining))
+            # Resolver título visible (maestro > descripción > SKU)
+            title_show = ""
+            if isinstance(inv_map_sku, dict):
+                k = str(sku).strip()
+                title_show = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
+            title_show = title_show or (desc_ml or "") or str(sku)
 
-            img_cols = st.columns([1, 1, 4])
-            _img_state_key = f"s2_showimg_{sale_id}_{exp_sku}"
-            if _img_state_key not in st.session_state:
-                st.session_state[_img_state_key] = False
-            if img_cols[0].button("🖼️ Imagen", key=f"s2_btnimg_{sale_id}_{exp_sku}", use_container_width=True):
-                st.session_state[_img_state_key] = not bool(st.session_state.get(_img_state_key, False))
-            if img_cols[1].button("⚠️ Incidencia", key=f"s2_inc_{sale_id}_{exp_sku}", use_container_width=True):
-                _s2_mark_incidence(mid, sale_id, str(exp_sku))
+            if remaining <= 0:
+                st.info(f"✅ Ya está completo: {title_show}")
+                st.session_state["s2_clear_prod_scan"] = True
+                sfx_emit("ERR")
                 st.rerun()
-            if img_cols[2].button("📝 Confirmar sin EAN", key=f"s2_noean_{sale_id}_{exp_sku}", use_container_width=True):
-                _s2_force_done_no_ean(mid, sale_id, str(exp_sku))
+            else:
+                sfx_emit("OK")
+                st.session_state["s2_pending_sku"] = str(sku)
+                st.session_state["s2_pending_qty"] = int(remaining)
+                st.session_state["s2_pending_title"] = str(title_show)
+                st.session_state["s2_clear_prod_scan"] = True
                 st.rerun()
 
-            if st.session_state.get(_img_state_key, False):
-                try:
-                    pics, _pub_link = get_picture_urls_for_sku(str(exp_sku))
-                except Exception:
-                    pics, _pub_link = [], ""
-                if pics:
-                    st.image(pics[0], use_container_width=True)
+    # 2) Si hay un SKU pendiente: mostrar verificación de cantidad (sin digitar)
+    pending_sku = st.session_state.get("s2_pending_sku")
+    if pending_sku:
+        pending_qty = int(st.session_state.get("s2_pending_qty", 0) or 0)
+        pending_title = st.session_state.get("s2_pending_title", "") or pending_sku
+
+        st.warning(f"Verificar **{pending_qty}** unidad(es) para: **{pending_title}**")
+        cA, cB = st.columns([2, 1])
+        with cA:
+            if st.button(f"✅ Verificar {pending_qty} y cerrar producto", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
+                ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
+                if not ok:
+                    st.error(msg or "No se pudo aplicar.")
+                    sfx_emit("ERR")
                 else:
-                    st.caption("Sin imagen disponible")
-
-        pending_sku = st.session_state.get("s2_pending_sku")
-        if pending_sku:
-            pending_qty = int(st.session_state.get("s2_pending_qty", 0) or 0)
-            pending_title = st.session_state.get("s2_pending_title", "") or pending_sku
-            st.warning(f"Verificar **{pending_qty}** unidad(es) para: **{pending_title}**")
-            cA, cB = st.columns([2, 1])
-            with cA:
-                if st.button(f"✅ Verificar {pending_qty} y cerrar producto", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
-                    ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
-                    if not ok:
-                        st.error(msg or "No se pudo aplicar.")
-                        sfx_emit("ERR")
-                    else:
-                        sfx_emit("OK")
-                        st.session_state["s2_pending_sku"] = None
-                        st.session_state["s2_pending_qty"] = 0
-                        st.session_state["s2_pending_title"] = ""
-                        st.rerun()
-            with cB:
-                if st.button("Cancelar", key=f"s2_verify_cancel_{sale_id}_{pending_sku}", use_container_width=True):
+                    sfx_emit("OK")
                     st.session_state["s2_pending_sku"] = None
                     st.session_state["s2_pending_qty"] = 0
                     st.session_state["s2_pending_title"] = ""
                     st.rerun()
-    else:
-        st.success("Todos los productos de esta venta están completos o con incidencia.")
-
-    with st.expander("Ver lista completa de productos de la venta", expanded=False):
-        full_rows = []
-        for sku, desc, qty, picked, status in items:
-            full_rows.append({
-                "SKU": str(sku),
-                "Producto": _s2_title_for_sku(inv_map_sku, str(sku), desc),
-                "Solicitado": int(qty or 0),
-                "Verificado": int(picked or 0),
-                "Estado": str(status or ""),
-            })
-        if full_rows:
-            st.dataframe(full_rows, use_container_width=True, hide_index=True)
-        else:
-            st.info("Venta sin productos detectados.")
+        with cB:
+            if st.button("Cancelar", key=f"s2_verify_cancel_{sale_id}_{pending_sku}", use_container_width=True):
+                st.session_state["s2_pending_sku"] = None
+                st.session_state["s2_pending_qty"] = 0
+                st.session_state["s2_pending_title"] = ""
+                st.rerun()
 
     done = _s2_is_sale_done(mid, sale_id)
+
     st.subheader("Cerrar venta")
     if done:
-        c1, c2 = st.columns([1, 2])
+        c1, c2 = st.columns([1,2])
         with c1:
             confirm_close = st.checkbox("Confirmo cierre", key=f"s2_confirm_close_{sale_id}")
         with c2:
@@ -6361,7 +6532,8 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 st.session_state["s2_clear_label_scan"] = True
                 st.rerun()
     else:
-        st.info("Para cerrar: completa el producto actual y luego los siguientes, o marca Incidencia / Sin EAN.")
+        st.info("Para cerrar: completa todos los productos o márcalos como Incidencia / Sin EAN.")
+
 
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
@@ -7269,3 +7441,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# PATCH_SAFE_S2_ITEMS_DYNAMIC_SCHEMA_2026_05_28
