@@ -6378,7 +6378,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                         rows = c.execute("""
                             SELECT
                                 s.manifest_id,
-                                COALESCE(m.lot_name, m.name, 'Lote ' || s.manifest_id) AS lote,
+                                ('Lote ' || s.manifest_id) AS lote,
                                 s.mesa,
                                 s.page_no,
                                 s.sale_id,
@@ -6386,9 +6386,8 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                                 s.pack_id,
                                 s.status
                             FROM s2_sales s
-                            LEFT JOIN s2_manifests m ON m.id = s.manifest_id
                             WHERE s.shipment_id=? OR s.pack_id=?
-                            ORDER BY s.manifest_id DESC, s.page_no, s.row_no
+                            ORDER BY s.manifest_id DESC, s.page_no, s.sale_id
                             LIMIT 10;
                         """, (sid, sid)).fetchall()
                         conn.close()
