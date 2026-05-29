@@ -6276,10 +6276,50 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
     sale_id = st.session_state.get("s2_sale_open")
 
+    # Si hay una venta abierta, esa venta pertenece a una mesa específica.
+    # Al cambiar a otra mesa NO se debe arrastrar el scanner/producto de la mesa anterior.
+    open_sale_mesa = None
+    if sale_id is not None:
+        try:
+            _row_mesa = db_fetchone(
+                "SELECT mesa FROM s2_sales WHERE manifest_id=? AND sale_id=? LIMIT 1",
+                (int(mid), str(sale_id)),
+            )
+            if _row_mesa and _row_mesa[0] is not None:
+                open_sale_mesa = int(_row_mesa[0])
+        except Exception:
+            open_sale_mesa = None
+
+    mesa_mismatch = bool(sale_id is not None and open_sale_mesa is not None and open_sale_mesa != int(mesa))
+
     # =========================
     # 1) SCANNER SIEMPRE PRIMERO
     # =========================
     st.markdown("### 1. Escanear etiqueta / producto")
+
+    if mesa_mismatch:
+        st.warning(
+            f"Hay una venta abierta en Mesa {open_sale_mesa}. "
+            f"La Mesa {int(mesa)} queda bloqueada hasta terminar o cerrar esa venta."
+        )
+        st.caption("Vuelve a la mesa activa para continuar con el escaneo del producto pendiente.")
+
+        with st.expander(f"🏷️ Etiquetas asignadas a Mesa {int(mesa)}", expanded=False):
+            conn = get_conn()
+            c = conn.cursor()
+            rows = c.execute("""
+                SELECT page_no, row_no, sale_id, shipment_id, customer, status
+                FROM s2_sales
+                WHERE manifest_id=? AND mesa=?
+                ORDER BY page_no, row_no, sale_id;
+            """, (mid, int(mesa))).fetchall()
+            conn.close()
+            if rows:
+                df = pd.DataFrame(rows, columns=["Página", "Orden", "Venta", "Etiqueta/Envío", "Cliente", "Estado"])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay etiquetas asignadas a esta mesa.")
+        return
 
     if sale_id is None:
         if st.session_state.get("s2_clear_label_scan"):
@@ -6327,6 +6367,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     if sale_to_open:
                         st.session_state["s2_sale_open"] = sale_to_open
                         st.session_state["s2_sale_open_manifest_id"] = mid
+                        st.session_state["s2_sale_open_mesa"] = int(mesa)
                         st.session_state["s2_clear_label_scan"] = True
                         sfx_emit("OK")
                         st.rerun()
@@ -6619,6 +6660,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     _s2_close_sale(mid, sale_id)
                     st.session_state["s2_sale_open"] = None
                     st.session_state["s2_sale_open_manifest_id"] = None
+                    st.session_state["s2_sale_open_mesa"] = None
                     st.session_state["s2_pending_sku"] = None
                     st.session_state["s2_pending_qty"] = 0
                     st.session_state["s2_pending_title"] = ""
