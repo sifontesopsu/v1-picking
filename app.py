@@ -5940,6 +5940,37 @@ def _s2_mark_incidence(mid:int, sale_id:str, sku:str, note:str=""):
     conn.commit()
     conn.close()
 
+
+def _s2_mark_shortage(mid:int, sale_id:str, sku:str, missing_qty:int, note:str=""):
+    """Marca un producto como terminado con faltante parcial o total.
+
+    Regla operativa Sorting/Camarero:
+    - El operador escanea una sola vez para validar producto.
+    - Luego cuenta físicamente y selecciona cuántas unidades faltan.
+    - Si faltan menos que el total, deja picked = qty - faltante.
+    - El estado queda INCIDENCE para cerrar el producto con evidencia de faltante.
+    """
+    _s2_ensure_items_schema_runtime()
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("SELECT qty, picked FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
+    row=c.fetchone()
+    if not row:
+        conn.close()
+        return False, "SKU no pertenece a esta venta"
+    qty=int(row[0] or 0)
+    missing=max(1, min(int(missing_qty or 1), qty))
+    verified=max(0, qty-missing)
+    note_txt = (note or f"Faltante declarado por operador: faltan {missing} de {qty}").strip()
+    c.execute("""UPDATE s2_items
+                 SET picked=?, status='INCIDENCE', confirm_mode='SHORTAGE', updated_at=?
+                 WHERE manifest_id=? AND sale_id=? AND sku=?;""",
+              (verified, _s2_now_iso(), mid, sale_id, sku))
+    # Si existe tabla de incidencias de sorting en futuras versiones, no dependemos de ella aquí.
+    conn.commit()
+    conn.close()
+    return True, None
+
 def _s2_force_done_no_ean(mid:int, sale_id:str, sku:str):
     _s2_ensure_items_schema_runtime()
     conn=get_conn()
@@ -6555,13 +6586,29 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     st.session_state["s2_pending_title"] = ""
                     st.rerun()
         with cB:
-            if st.button("⚠️ FALTANTE", key=f"s2_pending_inc_{sale_id}_{pending_sku}", use_container_width=True):
-                _s2_mark_incidence(mid, sale_id, str(pending_sku))
-                sfx_emit("ERR")
-                st.session_state["s2_pending_sku"] = None
-                st.session_state["s2_pending_qty"] = 0
-                st.session_state["s2_pending_title"] = ""
-                st.rerun()
+            st.markdown("**⚠️ FALTANTE**")
+            st.caption("Selecciona cuántas unidades faltan. No edites cantidad.")
+
+        # Faltante visual rápido: botones por cantidad faltante.
+        # Para qty=1 es un único botón. Para qty>1 permite faltante parcial sin escribir.
+        max_missing_buttons = min(int(pending_qty), 12)
+        miss_cols = st.columns(max_missing_buttons if max_missing_buttons > 0 else 1)
+        for miss in range(1, max_missing_buttons + 1):
+            with miss_cols[miss-1]:
+                label = f"Falta {miss}" if int(pending_qty) > 1 else "⚠️ Falta 1"
+                if st.button(label, key=f"s2_short_{sale_id}_{pending_sku}_{miss}", use_container_width=True):
+                    ok, msg = _s2_mark_shortage(mid, sale_id, str(pending_sku), int(miss))
+                    if not ok:
+                        st.error(msg or "No se pudo registrar faltante.")
+                        sfx_emit("ERR")
+                    else:
+                        sfx_emit("ERR")
+                        st.session_state["s2_pending_sku"] = None
+                        st.session_state["s2_pending_qty"] = 0
+                        st.session_state["s2_pending_title"] = ""
+                        st.rerun()
+        if int(pending_qty) > 12:
+            st.caption("Para cantidades mayores a 12, usa el botón que refleje el faltante real si está visible; si no, marca faltante total y revisa en supervisor.")
 
     if next_item:
         sku, desc, qty, picked, status = next_item
@@ -6594,8 +6641,10 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 m3.metric("Falta", faltan)
 
                 b1, b2 = st.columns(2)
-                if b1.button("⚠️ Incidencia", key=f"s2_inc_current_{sale_id}_{sku}", use_container_width=True):
-                    _s2_mark_incidence(mid, sale_id, str(sku))
+                if b1.button("⚠️ Faltante", key=f"s2_short_current_{sale_id}_{sku}", use_container_width=True):
+                    # Sin escaneo del producto: se considera faltante total para este SKU.
+                    # El flujo recomendado para faltante parcial es escanear una vez y escoger cuántas faltan arriba.
+                    _s2_mark_shortage(mid, sale_id, str(sku), int(faltan or 1))
                     st.rerun()
                 if b2.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
                     _s2_force_done_no_ean(mid, sale_id, str(sku))
@@ -6685,7 +6734,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     st.session_state["s2_clear_label_scan"] = True
                     st.rerun()
         else:
-            st.info("Para cerrar: completa el producto actual y luego los siguientes, o marca Incidencia / Sin EAN.")
+            st.info("Para cerrar: completa el producto actual y luego los siguientes, o marca Faltante / Sin EAN.")
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
