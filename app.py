@@ -6233,21 +6233,32 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         else:
             st.info("Este lote todavía no tiene páginas asignadas.")
 
+
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
+    """Camarero compacto: scanner primero, producto actual segundo, detalles abajo."""
     _s2_create_tables()
     _s2_ensure_items_schema_runtime()
+
     st.title("Camarero")
-    st.caption("Escaneo por etiqueta (Flex/Colecta) y productos por SKU/EAN")
+    st.caption("Escaneo por etiqueta y verificación producto por producto")
 
-    mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
-    st.session_state["s2_mesa_int"] = int(mesa)  # store separately; do not overwrite widget key
-
-    # State: current sale
+    # Estado base
     if "s2_sale_open" not in st.session_state:
         st.session_state["s2_sale_open"] = None
     if "s2_sale_open_manifest_id" not in st.session_state:
         st.session_state["s2_sale_open_manifest_id"] = None
+    if "s2_pending_sku" not in st.session_state:
+        st.session_state["s2_pending_sku"] = None
+        st.session_state["s2_pending_qty"] = 0
+        st.session_state["s2_pending_title"] = ""
 
+    # Selector de mesa compacto arriba a la derecha
+    h1, h2 = st.columns([7, 1])
+    with h2:
+        mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
+    st.session_state["s2_mesa_int"] = int(mesa)
+
+    # Detectar manifiesto activo de la mesa
     if st.session_state["s2_sale_open"] is not None and st.session_state.get("s2_sale_open_manifest_id"):
         mid = int(st.session_state["s2_sale_open_manifest_id"])
     else:
@@ -6256,31 +6267,41 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             st.warning(f"La mesa {int(mesa)} no está asignada a ningún manifiesto abierto.")
             return
     st.session_state["sorting_manifest_id"] = mid
-    st.caption(f"Lote detectado para esta mesa: {_s2_lot_label(mid)}")
 
     if _s2_is_mesa_closed(mid, int(mesa)):
         st.success(f"La mesa {int(mesa)} ya fue cerrada en camarero.")
         return
 
-    if st.session_state["s2_sale_open"] is None:
-        st.subheader("Escanea etiqueta (QR Flex o barra Colecta)")
-        # Limpieza segura del campo de escaneo (evita StreamlitAPIException)
+    sale_id = st.session_state.get("s2_sale_open")
+
+    # =========================
+    # 1) SCANNER SIEMPRE PRIMERO
+    # =========================
+    st.markdown("### 1. Escanear etiqueta / producto")
+
+    if sale_id is None:
         if st.session_state.get("s2_clear_label_scan"):
             st.session_state["s2_label_scan_widget"] = ""
             st.session_state["s2_clear_label_scan"] = False
 
-        scan = st.text_input("Etiqueta", key="s2_label_scan_widget")
+        scan = st.text_input(
+            "Escanea etiqueta del envío",
+            key="s2_label_scan_widget",
+            placeholder="Escanea QR Flex o barra Colecta",
+            label_visibility="collapsed",
+        )
+        autofocus_input("Escanea etiqueta del envío")
+
         if scan:
             sid = _s2_extract_shipment_id(scan)
             if not sid:
                 st.error("No pude leer el ID de envío desde el escaneo.")
                 sfx_emit("ERR")
             else:
-                # Secuencia obligatoria: solo se puede abrir la PRÓXIMA venta pendiente según manifiesto (página -> venta)
                 nxt = _s2_next_pending_sale_in_sequence(mid, int(mesa))
                 if not nxt:
                     st.success("No hay más ventas pendientes en esta mesa.")
-                    close_cols = st.columns([1, 1])
+                    close_cols = st.columns([1, 1, 4])
                     if close_cols[0].button("🔒 Cerrar mesa", key=f"s2_close_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
                         ok_close, err_close = _s2_close_mesa(mid, int(mesa))
                         if ok_close:
@@ -6293,50 +6314,145 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     if close_cols[1].button("↻ Refrescar", key=f"s2_refresh_mesa_btn_{mid}_{int(mesa)}", use_container_width=True):
                         st.session_state["s2_clear_label_scan"] = True
                         st.rerun()
-                    return
-                expected_sale_id, expected_ship, expected_pack, expected_page = nxt
-                sale_id = None
-                if sid and expected_ship and str(sid) == str(expected_ship):
-                    sale_id = expected_sale_id
-                elif sid and expected_pack and str(sid) == str(expected_pack):
-                    sale_id = expected_sale_id
-                if not sale_id:
-                    # Existe en el manifiesto pero NO es la siguiente venta => bloquear por secuencia
-                    conn=get_conn(); c=conn.cursor()
-                    c.execute("""SELECT mesa, page_no, status, shipment_id, pack_id
-                                 FROM s2_sales
-                                 WHERE manifest_id=? AND (shipment_id=? OR pack_id=?)
-                                 LIMIT 10;""", (mid, sid, sid))
-                    info=c.fetchall(); conn.close()
-                    if info:
-                        # ¿Está en esta mesa?
-                        in_same_mesa = [r for r in info if int(r[0] or 0) == int(mesa)]
-                        if in_same_mesa:
-                            exp_id = str(expected_ship or expected_pack or "")
-                            st.error(f"Secuencia obligatoria: la próxima venta de esta mesa es de la página {expected_page}.\n\nDebes escanear la siguiente etiqueta del manifiesto (ID esperado: {exp_id}).")
-                            sfx_emit("ERR")
-                        else:
-                            st.warning(f"Etiqueta encontrada, pero corresponde a otra mesa/página: {[(r[0], r[1], r[2]) for r in info]}")
-                            sfx_emit("ERR")
-                    else:
-                        st.error("No encontré esta etiqueta en corridas del manifiesto activo.")
-                        sfx_emit("ERR")
                 else:
-                    st.session_state["s2_sale_open"] = sale_id
-                    st.session_state["s2_sale_open_manifest_id"] = mid
-                    st.session_state["s2_clear_label_scan"] = True
-                    sfx_emit("OK")
+                    expected_sale_id, expected_ship, expected_pack, expected_page = nxt
+                    sale_to_open = None
+                    if sid and expected_ship and str(sid) == str(expected_ship):
+                        sale_to_open = expected_sale_id
+                    elif sid and expected_pack and str(sid) == str(expected_pack):
+                        sale_to_open = expected_sale_id
+
+                    if sale_to_open:
+                        st.session_state["s2_sale_open"] = sale_to_open
+                        st.session_state["s2_sale_open_manifest_id"] = mid
+                        st.session_state["s2_clear_label_scan"] = True
+                        sfx_emit("OK")
+                        st.rerun()
+                    else:
+                        # Buscar ubicación real de la etiqueta en cualquier lote abierto o histórico.
+                        conn = get_conn()
+                        c = conn.cursor()
+                        rows = c.execute("""
+                            SELECT
+                                s.manifest_id,
+                                COALESCE(m.lot_name, m.name, 'Lote ' || s.manifest_id) AS lote,
+                                s.mesa,
+                                s.page_no,
+                                s.sale_id,
+                                s.shipment_id,
+                                s.pack_id,
+                                s.status
+                            FROM s2_sales s
+                            LEFT JOIN s2_manifests m ON m.id = s.manifest_id
+                            WHERE s.shipment_id=? OR s.pack_id=?
+                            ORDER BY s.manifest_id DESC, s.page_no, s.row_no
+                            LIMIT 10;
+                        """, (sid, sid)).fetchall()
+                        conn.close()
+
+                        exp_id = str(expected_ship or expected_pack or "")
+                        if rows:
+                            msg = ["Etiqueta detectada, pero no corresponde a la próxima lectura obligatoria."]
+                            for r in rows:
+                                _mid, lote, mesa_real, page_real, sale_real, ship_real, pack_real, status_real = r
+                                msg.append(
+                                    f"- Pertenece a **{lote}**, **Mesa {mesa_real}**, **Página {page_real}**, "
+                                    f"Venta `{sale_real}`, Envío `{ship_real or pack_real}`, Estado `{status_real}`."
+                                )
+                            msg.append(f"\nPróxima etiqueta esperada para Mesa {int(mesa)}: `{exp_id}` · Página {expected_page}.")
+                            st.error("\n".join(msg))
+                        else:
+                            st.error(f"No encontré esta etiqueta en los manifiestos. Próxima esperada para Mesa {int(mesa)}: `{exp_id}` · Página {expected_page}.")
+                        sfx_emit("ERR")
+
+        st.caption("Escanea la próxima etiqueta asignada a esta mesa. La venta se abrirá automáticamente.")
+
+    else:
+        # Limpieza segura del campo de producto
+        if st.session_state.get("s2_clear_prod_scan"):
+            st.session_state["s2_prod_scan_widget"] = ""
+            st.session_state["s2_clear_prod_scan"] = False
+
+        pending_sku = st.session_state.get("s2_pending_sku")
+        sku_scan = st.text_input(
+            "Escanea producto",
+            key="s2_prod_scan_widget",
+            placeholder="Escanea EAN / SKU del producto",
+            disabled=bool(pending_sku),
+            label_visibility="collapsed",
+        )
+        autofocus_input("Escanea producto")
+        st.caption("Enfoca el lector y escanea. Se validará el producto y se avanzará automáticamente.")
+
+        sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
+        if sku_scan and not pending_sku:
+            sku = resolve_scan_to_sku(sku_scan, barcode_to_sku)
+
+            row = None
+            for _sku, _desc, _qty, _picked, _status in _s2_sale_items(mid, sale_id):
+                if str(_sku) == str(sku):
+                    row = (_qty, _picked, _desc)
+                    break
+
+            if not row:
+                st.error("SKU/EAN no pertenece a esta venta.")
+                sfx_emit("ERR")
+            else:
+                qty_req, picked_now, desc_ml = int(row[0]), int(row[1]), row[2]
+                remaining = max(0, qty_req - picked_now)
+
+                title_show = ""
+                if isinstance(inv_map_sku, dict):
+                    k = str(sku).strip()
+                    title_show = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
+                title_show = title_show or (desc_ml or "") or str(sku)
+
+                if remaining <= 0:
+                    st.info(f"✅ Ya está completo: {title_show}")
+                    st.session_state["s2_clear_prod_scan"] = True
+                    sfx_emit("ERR")
                     st.rerun()
+                else:
+                    sfx_emit("OK")
+                    st.session_state["s2_pending_sku"] = str(sku)
+                    st.session_state["s2_pending_qty"] = int(remaining)
+                    st.session_state["s2_pending_title"] = str(title_show)
+                    st.session_state["s2_clear_prod_scan"] = True
+                    st.rerun()
+
+    # =========================
+    # DATOS COMUNES DE VENTA / LISTAS
+    # =========================
+    if sale_id is None:
+        # Sin venta abierta: mostrar mesa abajo, no arriba
+        with st.expander(f"🏷️ Etiquetas asignadas a Mesa {int(mesa)}", expanded=True):
+            conn = get_conn()
+            c = conn.cursor()
+            rows = c.execute("""
+                SELECT page_no, row_no, sale_id, shipment_id, customer, status
+                FROM s2_sales
+                WHERE manifest_id=? AND mesa=?
+                ORDER BY page_no, row_no, sale_id;
+            """, (mid, int(mesa))).fetchall()
+            conn.close()
+            if rows:
+                df = pd.DataFrame(rows, columns=["Página", "Orden", "Venta", "Etiqueta/Envío", "Cliente", "Estado"])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay etiquetas asignadas a esta mesa.")
+        st.caption(f"Lote detectado para esta mesa: {_s2_lot_label(mid)}")
         return
 
-    sale_id = st.session_state["s2_sale_open"]
-    st.info(f"Venta abierta: {sale_id}")
-
-
-    # Información de la etiqueta / envío
-    conn=get_conn(); c=conn.cursor()
-    sale_row = c.execute("SELECT shipment_id, pack_id, customer, destino, comuna, ciudad_destino, page_no, mesa, status FROM s2_sales WHERE manifest_id=? AND sale_id=?;", (mid, sale_id)).fetchone()
+    # Venta abierta
+    conn = get_conn()
+    c = conn.cursor()
+    sale_row = c.execute("""
+        SELECT shipment_id, pack_id, customer, destino, comuna, ciudad_destino, page_no, mesa, status
+        FROM s2_sales
+        WHERE manifest_id=? AND sale_id=?;
+    """, (mid, sale_id)).fetchone()
     conn.close()
+
     shipment_id = sale_row[0] if sale_row else ""
     pack_id = sale_row[1] if sale_row else ""
     customer = sale_row[2] if sale_row else ""
@@ -6349,152 +6465,23 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     raw_label = _s2_get_label_raw(mid, shipment_id) if shipment_id else ""
     info = _s2_parse_label_raw_info(raw_label)
 
-    st.markdown("### Etiqueta / Envío")
-    a,b,cx = st.columns(3)
-    a.metric("Envío", str(shipment_id) if shipment_id else "-")
-    b.metric("Pack ID", str(pack_id) if pack_id else "-")
-    cx.metric("Mesa / Página", f"{mesa_db}/{page_no}" if page_no else str(mesa_db))
+    st.info(f"Venta abierta: {sale_id} · Mesa {mesa_db} · Página {page_no}")
 
-    # Datos de destino / cliente (desde etiqueta si existe; fallback a DB)
-    name = (info.get("destinatario") or customer or "-").strip() if isinstance(info, dict) else (customer or "-")
-    dom = (info.get("domicilio") or info.get("direccion") or destino_db or "-").strip() if isinstance(info, dict) else (destino_db or "-")
-    comuna = (info.get("comuna") or comuna_db or "-").strip() if isinstance(info, dict) else (comuna_db or "-")
-    ciudad_dest = (info.get("ciudad_destino") or ciudad_dest_db or "-").strip() if isinstance(info, dict) else (ciudad_dest_db or "-")
-
-    # Presentación compacta
-    st.write(f"**Cliente:** {name}")
-    if dom and dom != "-":
-        st.write(f"**Domicilio:** {dom}")
-    # FLEX: mostrar Comuna + Ciudad/Región (si vienen). COLECTA: ciudad_destino suele venir siempre.
-    if comuna and comuna != "-":
-        st.write(f"**Comuna:** {comuna}")
-    if ciudad_dest and ciudad_dest != "-":
-        st.write(f"**Ciudad destino:** {ciudad_dest}")
     items = _s2_sale_items(mid, sale_id)
-
-    st.markdown("### Productos de la venta")
     total_items = len(items)
-    done_items = sum(1 for _sku,_d,_q,_p,stx in items if stx in ("DONE","INCIDENCE"))
-    st.progress(0 if total_items==0 else done_items/total_items)
-    st.caption(f"{done_items}/{total_items} ítems finalizados (DONE o INCIDENCE)")
+    done_items = sum(1 for _sku, _d, _q, _p, stx in items if stx in ("DONE", "INCIDENCE"))
 
-    for sku, desc, qty, picked, status in items:
-        title = None
-        if isinstance(inv_map_sku, dict):
-            k = str(sku).strip()
-            title = inv_map_sku.get(k)
-            if title is None and k.isdigit():
-                try:
-                    title = inv_map_sku.get(str(int(k)))
-                except Exception:
-                    pass
-        title = title or desc or str(sku)
+    next_item = _s2_next_pending_item(mid, sale_id)
 
-        remaining = max(0, int(qty) - int(picked))
-        row1 = st.columns([6, 2, 2])
-        row1[0].markdown(f"### {title}  \nSKU: `{sku}`")
-        row1[1].markdown(f"## {int(qty)}")
-        row1[2].metric("Hecho", int(picked))
+    # =========================
+    # 2) PRODUCTO ACTUAL SEGUNDO
+    # =========================
+    st.markdown("### 2. Producto actual")
 
-        # Imagen (solo bajo demanda para no ocupar espacio)
-        _img_state_key = f"s2_showimg_{sale_id}_{sku}"
-        if _img_state_key not in st.session_state:
-            st.session_state[_img_state_key] = False
-
-        if st.button("🖼️ Ver imagen", key=f"s2_btnimg_{sale_id}_{sku}"):
-            st.session_state[_img_state_key] = not bool(st.session_state.get(_img_state_key, False))
-
-        if st.session_state.get(_img_state_key, False):
-            try:
-                pics, _pub_link = get_picture_urls_for_sku(str(sku))
-            except Exception:
-                pics, _pub_link = [], ""
-            if pics:
-                st.image(pics[0], use_container_width=True)
-            else:
-                st.caption("Sin imagen disponible")
-
-        if status != "DONE" and remaining > 0:
-            bcols = st.columns([1,1,6])
-            if bcols[0].button("⚠️ Incidencia", key=f"s2_inc_{sale_id}_{sku}"):
-                _s2_mark_incidence(mid, sale_id, str(sku))
-                st.rerun()
-            if bcols[1].button("📝 Sin EAN", key=f"s2_noean_{sale_id}_{sku}"):
-                _s2_force_done_no_ean(mid, sale_id, str(sku))
-                st.rerun()
-        st.divider()
-
-    st.subheader("Escanea SKU/EAN del producto")
-    st.caption("Escanea **1 vez**. Luego verificas la cantidad solicitada (sin digitar).")
-
-    # Estado de confirmación por producto
-    if "s2_pending_sku" not in st.session_state:
-        st.session_state["s2_pending_sku"] = None
-        st.session_state["s2_pending_qty"] = 0
-        st.session_state["s2_pending_title"] = ""
-
-    pending_sku = st.session_state.get("s2_pending_sku")
-
-    # Limpieza segura del campo de producto (evita StreamlitAPIException)
-    if st.session_state.get("s2_clear_prod_scan"):
-        st.session_state["s2_prod_scan_widget"] = ""
-        st.session_state["s2_clear_prod_scan"] = False
-
-    sku_scan = st.text_input(
-        "Producto",
-        key="s2_prod_scan_widget",
-        disabled=bool(pending_sku)  # mientras confirmas, bloquea nuevo escaneo
-    )
-
-    # 1) Al escanear: identificamos el SKU y preparamos la verificación automática de cantidad pendiente
-    sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
-    if sku_scan and not pending_sku:
-        sku = resolve_scan_to_sku(sku_scan, barcode_to_sku)
-
-        # Buscar qty/picked del ítem dentro de esta venta
-        _s2_ensure_items_schema_runtime()
-        connx = get_conn()
-        cx = connx.cursor()
-        cx.execute(
-            "SELECT qty, picked, description FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;",
-            (mid, sale_id, str(sku))
-        )
-        row = cx.fetchone()
-        connx.close()
-
-        if not row:
-            st.error("SKU/EAN no pertenece a esta venta.")
-            sfx_emit("ERR")
-        else:
-            qty_req, picked_now, desc_ml = int(row[0]), int(row[1]), row[2]
-            remaining = max(0, qty_req - picked_now)
-
-            # Resolver título visible (maestro > descripción > SKU)
-            title_show = ""
-            if isinstance(inv_map_sku, dict):
-                k = str(sku).strip()
-                title_show = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
-            title_show = title_show or (desc_ml or "") or str(sku)
-
-            if remaining <= 0:
-                st.info(f"✅ Ya está completo: {title_show}")
-                st.session_state["s2_clear_prod_scan"] = True
-                sfx_emit("ERR")
-                st.rerun()
-            else:
-                sfx_emit("OK")
-                st.session_state["s2_pending_sku"] = str(sku)
-                st.session_state["s2_pending_qty"] = int(remaining)
-                st.session_state["s2_pending_title"] = str(title_show)
-                st.session_state["s2_clear_prod_scan"] = True
-                st.rerun()
-
-    # 2) Si hay un SKU pendiente: mostrar verificación de cantidad (sin digitar)
     pending_sku = st.session_state.get("s2_pending_sku")
     if pending_sku:
         pending_qty = int(st.session_state.get("s2_pending_qty", 0) or 0)
         pending_title = st.session_state.get("s2_pending_title", "") or pending_sku
-
         st.warning(f"Verificar **{pending_qty}** unidad(es) para: **{pending_title}**")
         cA, cB = st.columns([2, 1])
         with cA:
@@ -6516,25 +6503,136 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 st.session_state["s2_pending_title"] = ""
                 st.rerun()
 
-    done = _s2_is_sale_done(mid, sale_id)
+    if next_item:
+        sku, desc, qty, picked, status = next_item
+        title = ""
+        if isinstance(inv_map_sku, dict):
+            k = str(sku).strip()
+            title = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
+        title = title or desc or str(sku)
+        faltan = max(0, int(qty) - int(picked))
 
-    st.subheader("Cerrar venta")
-    if done:
-        c1, c2 = st.columns([1,2])
-        with c1:
-            confirm_close = st.checkbox("Confirmo cierre", key=f"s2_confirm_close_{sale_id}")
-        with c2:
-            if st.button("✅ Cerrar venta y volver a escanear etiqueta", key=f"s2_close_{sale_id}", use_container_width=True, disabled=not confirm_close):
-                _s2_close_sale(mid, sale_id)
-                st.session_state["s2_sale_open"] = None
-                st.session_state["s2_sale_open_manifest_id"] = None
-                st.session_state["s2_clear_prod_scan"] = True
-                st.session_state["s2_clear_label_scan"] = True
-                st.rerun()
+        card = st.container(border=True)
+        with card:
+            left, right = st.columns([1, 6])
+            with left:
+                st.markdown(" ")
+                try:
+                    pics, _pub_link = get_picture_urls_for_sku(str(sku))
+                except Exception:
+                    pics, _pub_link = [], ""
+                if pics:
+                    st.image(pics[0], use_container_width=True)
+                else:
+                    st.caption("Sin imagen")
+            with right:
+                st.markdown(f"## {title}")
+                st.caption(f"SKU: {sku}")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Solicitado", int(qty))
+                m2.metric("Verificado", int(picked))
+                m3.metric("Falta", faltan)
+
+                b1, b2, b3 = st.columns(3)
+                if b1.button("🖼️ Ver imagen", key=f"s2_btnimg_current_{sale_id}_{sku}", use_container_width=True):
+                    st.session_state[f"s2_showimg_current_{sale_id}_{sku}"] = not bool(st.session_state.get(f"s2_showimg_current_{sale_id}_{sku}", False))
+                if b2.button("⚠️ Incidencia", key=f"s2_inc_current_{sale_id}_{sku}", use_container_width=True):
+                    _s2_mark_incidence(mid, sale_id, str(sku))
+                    st.rerun()
+                if b3.button("📋 Confirmar sin EAN", key=f"s2_noean_current_{sale_id}_{sku}", use_container_width=True):
+                    _s2_force_done_no_ean(mid, sale_id, str(sku))
+                    st.rerun()
+
+                if st.session_state.get(f"s2_showimg_current_{sale_id}_{sku}", False):
+                    if pics:
+                        st.image(pics[0], width=240)
+                    else:
+                        st.caption("Sin imagen disponible")
     else:
-        st.info("Para cerrar: completa todos los productos o márcalos como Incidencia / Sin EAN.")
+        st.success("✅ No quedan productos pendientes en esta venta.")
 
+    st.progress(0 if total_items == 0 else done_items / total_items)
+    st.caption(f"Avance venta: {done_items}/{total_items} productos finalizados")
 
+    # =========================
+    # DETALLES ABAJO, ABIERTOS POR DEFECTO
+    # =========================
+    with st.expander(f"🏷️ 3. Etiquetas asignadas a Mesa {int(mesa)}", expanded=True):
+        conn = get_conn()
+        c = conn.cursor()
+        rows = c.execute("""
+            SELECT page_no, row_no, sale_id, shipment_id, customer, status
+            FROM s2_sales
+            WHERE manifest_id=? AND mesa=?
+            ORDER BY page_no, row_no, sale_id;
+        """, (mid, int(mesa))).fetchall()
+        conn.close()
+        if rows:
+            df = pd.DataFrame(rows, columns=["Página", "Orden", "Venta", "Etiqueta/Envío", "Cliente", "Estado"])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay etiquetas asignadas a esta mesa.")
+
+    with st.expander("4. Información etiqueta / cliente", expanded=True):
+        a, b, cx = st.columns(3)
+        a.metric("Envío", str(shipment_id) if shipment_id else "-")
+        b.metric("Pack ID", str(pack_id) if pack_id else "-")
+        cx.metric("Mesa / Página", f"{mesa_db}/{page_no}" if page_no else str(mesa_db))
+
+        name = (info.get("destinatario") or customer or "-").strip() if isinstance(info, dict) else (customer or "-")
+        dom = (info.get("domicilio") or info.get("direccion") or destino_db or "-").strip() if isinstance(info, dict) else (destino_db or "-")
+        comuna = (info.get("comuna") or comuna_db or "-").strip() if isinstance(info, dict) else (comuna_db or "-")
+        ciudad_dest = (info.get("ciudad_destino") or ciudad_dest_db or "-").strip() if isinstance(info, dict) else (ciudad_dest_db or "-")
+
+        st.write(f"**Cliente:** {name}")
+        if dom and dom != "-":
+            st.write(f"**Domicilio:** {dom}")
+        if comuna and comuna != "-":
+            st.write(f"**Comuna:** {comuna}")
+        if ciudad_dest and ciudad_dest != "-":
+            st.write(f"**Ciudad destino:** {ciudad_dest}")
+
+    with st.expander(f"5. Lista completa de productos de la venta ({done_items}/{total_items} finalizados)", expanded=True):
+        if items:
+            rows = []
+            for idx, (sku, desc, qty, picked, status) in enumerate(items, start=1):
+                title = ""
+                if isinstance(inv_map_sku, dict):
+                    k = str(sku).strip()
+                    title = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
+                title = title or desc or str(sku)
+                rows.append({
+                    "#": idx,
+                    "SKU": sku,
+                    "Descripción": title,
+                    "Solicitado": int(qty),
+                    "Verificado": int(picked),
+                    "Falta": max(0, int(qty) - int(picked)),
+                    "Estado": "PENDIENTE" if status == "PENDING" else status,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay productos para esta venta.")
+
+    done = _s2_is_sale_done(mid, sale_id)
+    with st.expander("6. Cerrar venta", expanded=True):
+        if done:
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                confirm_close = st.checkbox("Confirmo cierre", key=f"s2_confirm_close_{sale_id}")
+            with c2:
+                if st.button("✅ Cerrar venta y volver a escanear etiqueta", key=f"s2_close_{sale_id}", use_container_width=True, disabled=not confirm_close):
+                    _s2_close_sale(mid, sale_id)
+                    st.session_state["s2_sale_open"] = None
+                    st.session_state["s2_sale_open_manifest_id"] = None
+                    st.session_state["s2_pending_sku"] = None
+                    st.session_state["s2_pending_qty"] = 0
+                    st.session_state["s2_pending_title"] = ""
+                    st.session_state["s2_clear_prod_scan"] = True
+                    st.session_state["s2_clear_label_scan"] = True
+                    st.rerun()
+        else:
+            st.info("Para cerrar: completa el producto actual y luego los siguientes, o marca Incidencia / Sin EAN.")
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
