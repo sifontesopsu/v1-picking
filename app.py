@@ -6632,10 +6632,16 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             with right:
                 st.markdown(f"### {title}")
                 st.caption(f"SKU: {sku}")
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Solicitado", int(qty))
-                m2.metric("Verificado", int(picked))
-                m3.metric("Falta", faltan)
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid #e5e7eb; background:#f8fafc; border-radius:10px; padding:8px 10px; margin:4px 0 8px 0;">
+                      <div style="font-size:13px; font-weight:900; color:#374151; letter-spacing:.02em;">FALTAN</div>
+                      <div style="font-size:42px; line-height:.9; font-weight:950; color:#111827; margin-top:2px;">{faltan}</div>
+                      <div style="font-size:12px; font-weight:700; color:#6b7280; margin-top:4px;">{int(picked)} / {int(qty)} verificadas</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
                 b1, b2 = st.columns(2)
                 if b1.button("⚠️ FALTANTE", key=f"s2_short_current_open_{sale_id}_{sku}", use_container_width=True):
