@@ -26,7 +26,7 @@ URL_EMISION_PACKS = "https://www.kameone.cl/Reporte/EmisionPackStockDisponible?i
 USER = "gsifontes@faurora.cl"
 PASSWORD = "Dimasoft0858"
 
-DOWNLOAD_FOLDER = r"C:\Users\VNP-4\Downloads"
+DOWNLOAD_FOLDER = r"C:\Users\administrador\Downloads"
 BODEGA_OBJETIVO = "BODEGA UNIVERSAL"
 BRANCH_NAME = "main"
 
