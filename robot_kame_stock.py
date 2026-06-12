@@ -3,6 +3,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +37,10 @@ MIN_PACK_ROWS = 500
 SLEEP_SECONDS = 300
 LOCK_FILE_NAME = ".robot_kame_stock.lock"
 
-REPO_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    REPO_DIR = Path(sys.executable).resolve().parent
+else:
+    REPO_DIR = Path(__file__).resolve().parent
 JSON_SALIDA = REPO_DIR / "stock_kame.json"
 LOCK_FILE = REPO_DIR / LOCK_FILE_NAME
 
@@ -52,24 +56,98 @@ def wait(driver, seconds=TIMEOUT):
     return WebDriverWait(driver, seconds)
 
 
+
 class SingleInstanceLock:
     def __init__(self, path: Path):
         self.path = path
         self.fd = None
+        self.acquired = False
+
+    def _obtener_command_line_windows(self, pid: str) -> str:
+        """
+        Devuelve la línea de comando del proceso en Windows.
+        Si el proceso no existe o no se puede leer, devuelve vacío.
+        """
+        if not str(pid).isdigit():
+            return ""
+
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False
+            )
+            return (result.stdout or "").strip()
+        except Exception:
+            return ""
+
+    def _parece_robot_activo(self, pid: str) -> bool:
+        """
+        Evita falsos bloqueos:
+        - Si el PID existe pero pertenece a otro proceso, elimina el lock.
+        - Si realmente parece otra instancia del robot, bloquea el inicio.
+        """
+        cmd = self._obtener_command_line_windows(pid)
+        if not cmd:
+            return False
+
+        cmd_low = cmd.lower()
+        carpeta_repo = str(self.path.parent).lower()
+
+        indicadores_robot = [
+            "robot_kame_stock.py",
+            "robotstockkame.exe",
+            "robot_stock_kame.exe",
+        ]
+
+        if any(ind in cmd_low for ind in indicadores_robot):
+            if carpeta_repo in cmd_low or "robotstockkame" in cmd_low:
+                return True
+
+        return False
 
     def acquire(self):
-        try:
-            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self.fd, str(os.getpid()).encode("utf-8"))
-            os.fsync(self.fd)
-        except FileExistsError:
+        """
+        Crea un lock para evitar dos robots corriendo al mismo tiempo.
+
+        Si existe un lock viejo pero el proceso ya no corresponde al robot,
+        lo elimina automáticamente y permite iniciar.
+        """
+        for _ in range(2):
             try:
-                pid = self.path.read_text(encoding="utf-8").strip()
-            except Exception:
-                pid = "desconocido"
-            raise RuntimeError(
-                f"Ya existe otro proceso del bot corriendo o quedó un lock colgado: {self.path} (PID: {pid})."
-            )
+                self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, str(os.getpid()).encode("utf-8"))
+                os.fsync(self.fd)
+                self.acquired = True
+                return
+            except FileExistsError:
+                try:
+                    pid = self.path.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pid = "desconocido"
+
+                if self._parece_robot_activo(pid):
+                    raise RuntimeError(
+                        f"Ya existe otra instancia real del bot corriendo: {self.path} (PID: {pid})."
+                    )
+
+                debug(f"Lock colgado detectado. Se eliminará automáticamente: {self.path} (PID anterior: {pid})")
+                try:
+                    self.path.unlink()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"No se pudo eliminar el lock colgado: {self.path}. Error: {e}"
+                    )
+
+        raise RuntimeError(f"No se pudo adquirir el lock después de reintentar: {self.path}")
 
     def release(self):
         try:
@@ -77,8 +155,9 @@ class SingleInstanceLock:
                 os.close(self.fd)
         except Exception:
             pass
+
         try:
-            if self.path.exists():
+            if self.acquired and self.path.exists():
                 self.path.unlink()
         except Exception:
             pass
@@ -663,12 +742,8 @@ def git_sync_hard(repo_dir: Path, branch_name: str):
     debug(f"Git sync: reset --hard origin/{branch_name} ...")
     run_git(["reset", "--hard", f"origin/{branch_name}"], repo_dir)
 
-    try:
-        lock = repo_dir / LOCK_FILE_NAME
-        if lock.exists():
-            lock.unlink()
-    except Exception:
-        pass
+    # No se elimina el .lock aquí.
+    # El lock pertenece al proceso activo y se libera solo al cerrar el bot correctamente.
 
 
 def git_commit_y_push_resiliente(repo_dir: Path, archivo_relativo: str, payload_nuevo: dict, branch_name: str):
