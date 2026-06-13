@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-06-13 08:14:23",
-  "source_file": "inventariobodega_13-06-2026 12_08_15.xlsx",
+  "updated_at": "2026-06-13 08:26:47",
+  "source_file": "inventariobodega_13-06-2026 12_19_35.xlsx",
   "source_file_packs": "informeStockPacks.xlsx",
   "bodega": "BODEGA UNIVERSAL",
   "rows_read": 4976,
@@ -777,7 +777,7 @@
     "800202101005": 6,
     "800202101010": 17,
     "800202101015": 23,
-    "800202103005": 4,
+    "800202103005": 3,
     "800202103010": 6,
     "800202103000": 5,
     "800202111020": 8,
