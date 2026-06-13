@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-06-13 08:32:31",
-  "source_file": "inventariobodega_13-06-2026 12_26_16.xlsx",
+  "updated_at": "2026-06-13 08:38:12",
+  "source_file": "inventariobodega_13-06-2026 12_32_00.xlsx",
   "source_file_packs": "informeStockPacks.xlsx",
   "bodega": "BODEGA UNIVERSAL",
   "rows_read": 4976,
@@ -3016,7 +3016,7 @@
     "900604304020": 11,
     "900604304025": 1,
     "400901003030": 33,
-    "400901003060": 1543,
+    "400901003060": 1533,
     "400901003070": 7,
     "400901003100": 361,
     "400901003090": 208,
