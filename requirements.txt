@@ -1,8 +1,14 @@
-streamlit
-pandas
-openpyxl
-pdfplumber
-python-barcode
-Pillow
-reportlab
-duckduckgo-search
+streamlit>=1.37,<2
+pandas>=2.0,<3
+openpyxl>=3.1,<4
+pdfplumber>=0.11,<1
+python-barcode>=0.15,<1
+Pillow>=10,<13
+reportlab>=4,<5
+duckduckgo-search>=6,<9
+requests>=2.31,<3
+selenium>=4.20,<5
+webdriver-manager>=4,<5
+google-api-python-client>=2.130,<3
+google-auth>=2.29,<3
+# requests ya es usado por la app y por la sincronización con Sheets
