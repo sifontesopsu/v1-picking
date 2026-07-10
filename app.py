@@ -12,7 +12,23 @@ import string
 import requests
 import logging
 from contextlib import contextmanager
-from sheets_sync import start_sheets_sync, get_sync_status
+try:
+    from sheets_sync import start_sheets_sync, get_sync_status
+    SHEETS_SYNC_MODULE_AVAILABLE = True
+except ModuleNotFoundError:
+    SHEETS_SYNC_MODULE_AVAILABLE = False
+
+    def start_sheets_sync(db_path, overrides=None):
+        return False
+
+    def get_sync_status(db_path):
+        return {
+            "enabled": 0,
+            "pending": 0,
+            "synced": 0,
+            "errors": 0,
+            "module_missing": True,
+        }
 from db_infrastructure import (
     connect as robust_connect,
     apply_migrations,
@@ -6231,6 +6247,8 @@ def main():
                 st.sidebar.caption("Sheets: sincronizado")
             else:
                 st.sidebar.caption(f"Sheets: {pending} evento(s) pendientes")
+        elif sync_state.get("module_missing"):
+            st.sidebar.warning("Sheets: falta sheets_sync.py en el repositorio")
         else:
             st.sidebar.caption("Sheets: no configurado")
     except Exception:
