@@ -10,65 +10,13 @@ import json
 import random
 import string
 import requests
-import logging
 from contextlib import contextmanager
-try:
-    from sheets_sync import start_sheets_sync, get_sync_status
-    SHEETS_SYNC_MODULE_AVAILABLE = True
-except ModuleNotFoundError:
-    SHEETS_SYNC_MODULE_AVAILABLE = False
-
-    def start_sheets_sync(db_path, overrides=None):
-        return False
-
-    def get_sync_status(db_path):
-        return {
-            "enabled": 0,
-            "pending": 0,
-            "synced": 0,
-            "errors": 0,
-            "module_missing": True,
-        }
-from db_infrastructure import (
-    connect as robust_connect,
-    apply_migrations,
-    ensure_runtime_objects,
-    schedule_backup_async,
-    configure_logging,
-)
 # =========================
 # CONFIG
 # =========================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = os.getenv("AURORA_DB_PATH", os.path.join(BASE_DIR, "aurora_ml.db"))
-BACKUP_DIR = os.getenv("AURORA_BACKUP_DIR", os.path.join(BASE_DIR, "backups"))
-BACKUP_INTERVAL_MINUTES = int(os.getenv("AURORA_BACKUP_INTERVAL_MINUTES", "60"))
-BACKUP_KEEP = int(os.getenv("AURORA_BACKUP_KEEP", "30"))
-LOG_FILE = configure_logging(BASE_DIR)
-logger = logging.getLogger("aurora_wms.app")
+DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
-
-# Endpoint publicado de Google Apps Script. Puede reemplazarse con la variable
-# AURORA_SHEETS_WEBHOOK_URL sin modificar el código.
-DEFAULT_SHEETS_WEBHOOK_URL = (
-    "https://script.google.com/macros/s/AKfycbx0YfTqCflqrPZrwLPfong07YopIL74B4YXNKoibLmc0QT1Kf6UDLNXacO4IJZp_Sr37A/exec"
-)
-
-
-def _sheets_sync_overrides():
-    """Configuración de Sheets integrada y compatible con variables de entorno."""
-    return {
-        "webhook_url": os.getenv(
-            "AURORA_SHEETS_WEBHOOK_URL",
-            DEFAULT_SHEETS_WEBHOOK_URL,
-        ).strip(),
-        "token": "",
-        "interval_seconds": int(os.getenv("AURORA_SHEETS_INTERVAL_SECONDS", "20")),
-        "batch_size": int(os.getenv("AURORA_SHEETS_BATCH_SIZE", "200")),
-        "timeout_seconds": int(os.getenv("AURORA_SHEETS_TIMEOUT_SECONDS", "20")),
-        "max_attempts": int(os.getenv("AURORA_SHEETS_MAX_ATTEMPTS", "100")),
-    }
 
 
 # =========================
@@ -100,6 +48,7 @@ CORTES_FILE = "CORTES.xlsx"
 
 # Links de publicaciones (SKU -> item/link/fotos)
 # Debe estar en el repo, en la misma carpeta que app.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PUBLICATIONS_FILE = os.path.join(BASE_DIR, "links_con_imagenes.xlsx")
 STOCK_KAME_FILE = os.path.join(BASE_DIR, "stock_kame.json")
 # =========================
@@ -455,8 +404,7 @@ def split_barcodes(cell_value) -> list[str]:
 
 
 def get_conn():
-    """Conexión SQLite robusta y uniforme para todos los módulos."""
-    return robust_connect(DB_NAME)
+    return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 
 # =========================
@@ -752,7 +700,6 @@ def autofocus_input(label: str):
 # =========================
 # DB INIT
 # =========================
-@st.cache_resource(show_spinner=False)
 def init_db():
     conn = get_conn()
     c = conn.cursor()
@@ -948,7 +895,6 @@ def init_db():
 
     conn.commit()
     conn.close()
-    apply_migrations(DB_NAME)
 
 # =========================
 # MAESTRO SKU/EAN (AUTO)
@@ -3461,7 +3407,6 @@ def _s2_ensure_items_schema_runtime():
         except Exception:
             pass
 
-@st.cache_resource(show_spinner=False)
 def _s2_create_tables():
     conn = get_conn()
     c = conn.cursor()
@@ -3627,11 +3572,6 @@ def _s2_create_tables():
 
     conn.commit()
     conn.close()
-    # Sorting crea tablas dinámicamente: instalar solo objetos faltantes una vez
-    # al terminar esta creación, sin ejecutar controles de integridad.
-    if not st.session_state.get("_s2_runtime_objects_ready", False):
-        ensure_runtime_objects(DB_NAME)
-        st.session_state["_s2_runtime_objects_ready"] = True
 
 def _s2_get_active_manifest_id():
     _s2_create_tables()
@@ -6216,14 +6156,6 @@ def main():
     _sfx_global_click_hook()
     sfx_render_pending()
     init_db()
-    try:
-        schedule_backup_async(DB_NAME, BACKUP_DIR, interval_minutes=BACKUP_INTERVAL_MINUTES, keep=BACKUP_KEEP)
-    except Exception:
-        logger.exception("Falló el respaldo automático; la app continuará operativa")
-    try:
-        start_sheets_sync(DB_NAME, _sheets_sync_overrides())
-    except Exception:
-        logger.exception("Falló el inicio de sincronización con Sheets; la app continuará operativa")
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, familia_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
@@ -6239,20 +6171,6 @@ def main():
 
     # Sidebar común
     st.sidebar.title("Ferretería Aurora – WMS")
-    try:
-        sync_state = get_sync_status(DB_NAME)
-        if int(sync_state.get("enabled", 0)):
-            pending = int(sync_state.get("pending", 0) or 0)
-            if pending == 0:
-                st.sidebar.caption("Sheets: sincronizado")
-            else:
-                st.sidebar.caption(f"Sheets: {pending} evento(s) pendientes")
-        elif sync_state.get("module_missing"):
-            st.sidebar.warning("Sheets: falta sheets_sync.py en el repositorio")
-        else:
-            st.sidebar.caption("Sheets: no configurado")
-    except Exception:
-        logger.exception("No se pudo consultar estado de Sheets")
 
     # Botón para volver al lobby
     if st.sidebar.button("⬅️ Cambiar modo"):
