@@ -1,4 +1,10 @@
 import os
+import faulthandler
+
+try:
+    faulthandler.enable()
+except Exception:
+    pass
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -404,7 +410,20 @@ def split_barcodes(cell_value) -> list[str]:
 
 
 def get_conn():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
+    """Conexión SQLite estable para Streamlit Cloud y uso concurrente."""
+    conn = sqlite3.connect(
+        DB_NAME,
+        timeout=30,
+        check_same_thread=False,
+    )
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+    return conn
 
 
 # =========================
