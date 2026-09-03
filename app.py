@@ -13,6 +13,7 @@ from datetime import datetime
 import re
 import html
 import json
+import math
 import random
 import string
 import requests
@@ -1759,6 +1760,549 @@ def _get_picking_batches_summary() -> list[dict]:
     return rows
 
 
+
+# =========================
+# REPARTO DINÁMICO PICKING POR SKU + FAMILIA
+# =========================
+SKU_BALANCE_WEIGHT = 0.70
+UNIT_BALANCE_WEIGHT = 0.30
+FAMILY_SPLIT_TOLERANCE = 1.20  # 20% sobre la carga objetivo antes de dividir una familia
+
+
+def _prepare_sku_family_workload(sales_df: pd.DataFrame, familia_map_sku: dict | None = None):
+    """Normaliza ventas y devuelve totales únicos por Familia + SKU.
+
+    La familia directa del maestro tiene prioridad. Para packs/SKU sin familia directa
+    se conserva el fallback histórico por los primeros 6 dígitos del SKU.
+    """
+    familia_map_sku = familia_map_sku or {}
+    dfw = sales_df.copy()
+    if dfw.empty:
+        return pd.DataFrame(columns=["family", "sku_ml", "qty"]), {}
+
+    dfw["sku_ml"] = dfw["sku_ml"].map(normalize_sku)
+    dfw = dfw[dfw["sku_ml"].ne("")].copy()
+    if dfw.empty:
+        return pd.DataFrame(columns=["family", "sku_ml", "qty"]), {}
+
+    dfw["qty"] = pd.to_numeric(dfw["qty"], errors="coerce").fillna(0).astype(int)
+    dfw = dfw[dfw["qty"] > 0].copy()
+
+    title_ml_by_sku = {}
+    if "title_ml" in dfw.columns:
+        for sku, g in dfw.groupby("sku_ml"):
+            title = ""
+            for value in g["title_ml"].tolist():
+                value = str(value or "").strip()
+                if value and value.lower() != "nan":
+                    title = value
+                    break
+            title_ml_by_sku[str(sku)] = title
+
+    fam_counts = {}
+    try:
+        for key, value in familia_map_sku.items():
+            base_sku = normalize_sku(key)
+            fam = str(value or "").strip()
+            if not base_sku or len(base_sku) < 6 or not fam or fam.lower() == "nan":
+                continue
+            pref6 = base_sku[:6]
+            fam_counts.setdefault(pref6, {})
+            fam_counts[pref6][fam] = fam_counts[pref6].get(fam, 0) + 1
+    except Exception:
+        fam_counts = {}
+
+    fam_prefix6 = {}
+    for pref6, fam_map in fam_counts.items():
+        fam_prefix6[pref6] = sorted(fam_map.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+    def _fam_for_sku(sku: str) -> str:
+        direct = str(familia_map_sku.get(sku, "") or "").strip()
+        if direct and direct.lower() != "nan":
+            return direct
+        sku_norm = normalize_sku(sku)
+        if not sku_norm:
+            return "Sin Familia"
+        inferred = fam_prefix6.get(sku_norm[:6], "")
+        return inferred if inferred else "Sin Familia"
+
+    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
+    grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
+    grp["qty"] = grp["qty"].astype(int)
+    return grp, title_ml_by_sku
+
+
+def _normalized_picker_load(sku_count: int, units: int, target_skus: float, target_units: float) -> float:
+    sku_ratio = (float(sku_count) / float(target_skus)) if target_skus > 0 else 0.0
+    unit_ratio = (float(units) / float(target_units)) if target_units > 0 else 0.0
+    return (SKU_BALANCE_WEIGHT * sku_ratio) + (UNIT_BALANCE_WEIGHT * unit_ratio)
+
+
+def _plan_sku_family_distribution(
+    sales_df: pd.DataFrame,
+    num_pickers: int,
+    familia_map_sku: dict | None = None,
+    cortes_set: set | None = None,
+    picker_names: list[str] | None = None,
+) -> dict:
+    """Planifica el reparto SKU/Familia sin escribir en BD.
+
+    Reglas:
+      1. Un SKU completo siempre queda en un solo picker.
+      2. La familia se mantiene junta mientras no rompa el equilibrio.
+      3. Una familia se divide en el mínimo número razonable de pickers; sólo puede abrirse
+         un picker adicional si el ajuste fino demuestra que mejora el equilibrio.
+      4. El balance pondera 70% SKU distintos y 30% unidades.
+      5. La cantidad de pickers es totalmente dinámica.
+    """
+    n = max(1, int(num_pickers or 1))
+    cortes_set = {normalize_sku(x) for x in (cortes_set or set()) if normalize_sku(x)}
+    grp, title_ml_by_sku = _prepare_sku_family_workload(sales_df, familia_map_sku)
+
+    names = [str(x).strip() for x in (picker_names or []) if str(x).strip()]
+    if len(names) < n:
+        names.extend([f"P{i+1}" for i in range(len(names), n)])
+    names = names[:n]
+
+    if grp.empty:
+        summary = pd.DataFrame([
+            {"Picker": names[i], "SKU": 0, "Unidades": 0, "Familias": 0, "Detalle familias": "-", "Carga estimada": "0%"}
+            for i in range(n)
+        ])
+        return {
+            "assignments": [[] for _ in range(n)],
+            "title_ml_by_sku": title_ml_by_sku,
+            "summary": summary,
+            "metrics": {
+                "total_skus": 0, "total_units": 0, "total_families": 0,
+                "split_families": 0, "split_family_names": [],
+                "avg_skus": 0.0, "avg_units": 0.0,
+                "min_skus": 0, "max_skus": 0, "min_units": 0, "max_units": 0,
+                "sku_imbalance_pct": 0.0, "unit_imbalance_pct": 0.0,
+                "max_weighted_deviation_pct": 0.0, "quality": "Sin carga",
+            },
+        }
+
+    grp = grp.copy()
+    grp["is_corte"] = grp["sku_ml"].map(lambda x: normalize_sku(x) in cortes_set)
+    work_grp = grp[~grp["is_corte"]].copy()
+
+    total_skus = int(len(work_grp))
+    total_units = int(work_grp["qty"].sum()) if not work_grp.empty else 0
+    target_skus = (float(total_skus) / n) if total_skus > 0 else 1.0
+    target_units = (float(total_units) / n) if total_units > 0 else 1.0
+
+    family_infos = []
+    for fam, fam_all in grp.groupby("family", sort=False):
+        fam_all = fam_all.copy()
+        fam_work = fam_all[~fam_all["is_corte"]].copy()
+        fam_cortes = fam_all[fam_all["is_corte"]].copy()
+        fam_skus = int(len(fam_work))
+        fam_units = int(fam_work["qty"].sum()) if not fam_work.empty else 0
+        fam_score = _normalized_picker_load(fam_skus, fam_units, target_skus, target_units)
+
+        if fam_skus <= 0:
+            chunk_count = 1
+        else:
+            # SKU es la señal principal: ningún bloque de familia debería superar
+            # por sí solo el objetivo de SKU + 20% si puede evitarse. La carga
+            # ponderada (SKU + unidades) actúa como segunda señal.
+            sku_upper = max(1.0, target_skus * FAMILY_SPLIT_TOLERANCE)
+            chunks_by_sku = max(1, int(math.ceil(float(fam_skus) / sku_upper)))
+            chunks_by_weight = max(1, int(math.ceil(fam_score / FAMILY_SPLIT_TOLERANCE)))
+            chunk_count = max(chunks_by_sku, chunks_by_weight)
+            chunk_count = min(chunk_count, n, fam_skus)
+
+        chunks = [{"rows": [], "sku_count": 0, "units": 0} for _ in range(chunk_count)]
+
+        if not fam_work.empty:
+            ranked_rows = []
+            for _, row in fam_work.iterrows():
+                qty = int(row["qty"] or 0)
+                indiv_score = _normalized_picker_load(1, qty, target_skus, target_units)
+                ranked_rows.append((indiv_score, qty, str(row["sku_ml"]), row.to_dict()))
+            ranked_rows.sort(key=lambda x: (-x[0], -x[1], x[2]))
+
+            for _, qty, _, row_dict in ranked_rows:
+                best_idx = min(
+                    range(chunk_count),
+                    key=lambda ci: (
+                        _normalized_picker_load(
+                            chunks[ci]["sku_count"] + 1,
+                            chunks[ci]["units"] + qty,
+                            target_skus,
+                            target_units,
+                        ),
+                        chunks[ci]["sku_count"],
+                        chunks[ci]["units"],
+                        ci,
+                    ),
+                )
+                chunks[best_idx]["rows"].append(row_dict)
+                chunks[best_idx]["sku_count"] += 1
+                chunks[best_idx]["units"] += qty
+
+        # CORTES no consumen carga de picking PDA. Se mantienen junto a la primera
+        # porción de su familia sólo para conservar trazabilidad de la OT.
+        if not fam_cortes.empty:
+            for _, row in fam_cortes.iterrows():
+                chunks[0]["rows"].append(row.to_dict())
+
+        family_infos.append({
+            "family": str(fam),
+            "score": fam_score,
+            "sku_count": fam_skus,
+            "units": fam_units,
+            "chunks": chunks,
+        })
+
+    # Familias más pesadas primero para evitar que una grande quede sin capacidad al final.
+    family_infos.sort(key=lambda x: (-x["score"], -x["sku_count"], -x["units"], x["family"]))
+    # El ajuste fino puede abrir como máximo un picker adicional por familia sobre
+    # la división mínima calculada. Evita que una familia termine dispersa por toda la bodega.
+    family_picker_cap = {
+        info["family"]: min(n, max(1, len(info["chunks"])) + 1)
+        for info in family_infos
+    }
+
+    picker_state = [
+        {"name": names[i], "rows": [], "sku_count": 0, "units": 0, "families": set()}
+        for i in range(n)
+    ]
+
+    # Asignar los bloques globalmente, del más pesado al más liviano. La cantidad
+    # de bloques de cada familia ya fue limitada arriba, por lo que este paso mejora
+    # el balance sin fragmentar familias adicionales.
+    all_chunks = []
+    for fam_info in family_infos:
+        family = fam_info["family"]
+        for chunk in fam_info["chunks"]:
+            all_chunks.append({"family": family, "chunk": chunk})
+
+    all_chunks.sort(
+        key=lambda item: (
+            -_normalized_picker_load(
+                item["chunk"]["sku_count"],
+                item["chunk"]["units"],
+                target_skus,
+                target_units,
+            ),
+            -item["chunk"]["sku_count"],
+            -item["chunk"]["units"],
+            item["family"],
+        )
+    )
+
+    family_used_pickers = {}
+    for item in all_chunks:
+        family = item["family"]
+        chunk = item["chunk"]
+        used_for_family = family_used_pickers.setdefault(family, set())
+        available = [i for i in range(n) if i not in used_for_family]
+        if not available:
+            available = list(range(n))
+
+        target_idx = min(
+            available,
+            key=lambda pi: (
+                _normalized_picker_load(
+                    picker_state[pi]["sku_count"] + int(chunk["sku_count"]),
+                    picker_state[pi]["units"] + int(chunk["units"]),
+                    target_skus,
+                    target_units,
+                ),
+                picker_state[pi]["sku_count"],
+                picker_state[pi]["units"],
+                pi,
+            ),
+        )
+
+        picker_state[target_idx]["rows"].extend(chunk["rows"])
+        picker_state[target_idx]["sku_count"] += int(chunk["sku_count"])
+        picker_state[target_idx]["units"] += int(chunk["units"])
+        if chunk["rows"]:
+            picker_state[target_idx]["families"].add(family)
+        used_for_family.add(target_idx)
+
+    # Ajuste fino: si el reparto por bloques aún queda fuera de la banda deseada,
+    # mover SKU de una misma familia desde pickers sobrecargados hacia los más livianos.
+    # Sólo se hace cuando mejora objetivamente el balance y se penaliza abrir una familia
+    # en un picker adicional, para conservar la zonificación como prioridad.
+    def _state_deviation(sku_count: int, units: int) -> float:
+        sku_dev = abs(float(sku_count) - target_skus) / target_skus if target_skus > 0 else 0.0
+        unit_dev = abs(float(units) - target_units) / target_units if target_units > 0 else 0.0
+        return (SKU_BALANCE_WEIGHT * sku_dev) + (UNIT_BALANCE_WEIGHT * unit_dev)
+
+    def _state_load_score(state: dict) -> float:
+        return _normalized_picker_load(state["sku_count"], state["units"], target_skus, target_units)
+
+    max_rebalance_steps = min(100, max(10, total_skus * 2))
+    for _ in range(max_rebalance_steps):
+        current_devs = [_state_deviation(x["sku_count"], x["units"]) for x in picker_state]
+        current_max_dev = max(current_devs) if current_devs else 0.0
+        if current_max_dev <= 0.20:
+            break
+
+        ranked_high = sorted(range(n), key=lambda i: (-_state_load_score(picker_state[i]), i))[:3]
+        ranked_low = sorted(range(n), key=lambda i: (_state_load_score(picker_state[i]), i))[:3]
+        best_move = None
+
+        # Mapa actual de presencia de familia para calcular cuánto se fragmentaría.
+        fam_presence = {}
+        for pi, state in enumerate(picker_state):
+            for row in state["rows"]:
+                if bool(row.get("is_corte", False)):
+                    continue
+                fam = str(row.get("family") or "Sin Familia")
+                fam_presence.setdefault(fam, set()).add(pi)
+
+        for src in ranked_high:
+            src_state = picker_state[src]
+            if src_state["sku_count"] <= 1:
+                continue
+
+            src_families = {}
+            for row in src_state["rows"]:
+                if bool(row.get("is_corte", False)):
+                    continue
+                fam = str(row.get("family") or "Sin Familia")
+                src_families.setdefault(fam, []).append(row)
+
+            for dst in ranked_low:
+                if dst == src:
+                    continue
+                dst_state = picker_state[dst]
+                if _state_load_score(src_state) <= _state_load_score(dst_state):
+                    continue
+
+                other_devs = [current_devs[i] for i in range(n) if i not in (src, dst)]
+                other_max = max(other_devs) if other_devs else 0.0
+
+                for fam, fam_rows in src_families.items():
+                    if not fam_rows:
+                        continue
+
+                    # Evaluamos prefijos por cantidad alta y baja. Como cada SKU pesa 70%,
+                    # probar todos los tamaños permite acercarse al objetivo sin dividir SKU.
+                    candidate_orders = [
+                        sorted(fam_rows, key=lambda r: (-int(r.get("qty") or 0), str(r.get("sku_ml") or ""))),
+                        sorted(fam_rows, key=lambda r: (int(r.get("qty") or 0), str(r.get("sku_ml") or ""))),
+                    ]
+                    seen_candidates = set()
+                    for ordered in candidate_orders:
+                        qty_acc = 0
+                        for k in range(1, len(ordered) + 1):
+                            qty_acc += int(ordered[k - 1].get("qty") or 0)
+                            move_skus = tuple(sorted(str(r.get("sku_ml") or "") for r in ordered[:k]))
+                            if move_skus in seen_candidates:
+                                continue
+                            seen_candidates.add(move_skus)
+
+                            src_skus_new = src_state["sku_count"] - k
+                            src_units_new = src_state["units"] - qty_acc
+                            dst_skus_new = dst_state["sku_count"] + k
+                            dst_units_new = dst_state["units"] + qty_acc
+                            if src_skus_new < 0 or src_units_new < 0:
+                                continue
+
+                            src_dev_new = _state_deviation(src_skus_new, src_units_new)
+                            dst_dev_new = _state_deviation(dst_skus_new, dst_units_new)
+                            new_max_dev = max(other_max, src_dev_new, dst_dev_new)
+                            if new_max_dev >= current_max_dev - 1e-9:
+                                continue
+
+                            before_presence = set(fam_presence.get(fam, set()))
+                            after_presence = set(before_presence)
+                            # Si salen todos los SKU de picking de esta familia desde src, deja de estar allí.
+                            if k >= len(fam_rows):
+                                after_presence.discard(src)
+                            after_presence.add(dst)
+                            spread_delta = max(0, len(after_presence) - len(before_presence))
+                            if len(after_presence) > int(family_picker_cap.get(fam, n)):
+                                continue
+
+                            # Primero agotamos movimientos que NO aumentan la dispersión de familias.
+                            # Sólo si ya no existen, se permite abrir un picker adicional para esa familia.
+                            candidate = (
+                                spread_delta,
+                                new_max_dev,
+                                k,
+                                qty_acc,
+                                src,
+                                dst,
+                                fam,
+                                move_skus,
+                            )
+                            if best_move is None or candidate < best_move:
+                                best_move = candidate
+
+        if best_move is None:
+            break
+
+        _, new_max_dev, _, _, src, dst, fam, move_skus = best_move
+        move_set = set(move_skus)
+        moved_rows = []
+        kept_rows = []
+        for row in picker_state[src]["rows"]:
+            is_match = (
+                not bool(row.get("is_corte", False))
+                and str(row.get("family") or "Sin Familia") == fam
+                and str(row.get("sku_ml") or "") in move_set
+            )
+            if is_match:
+                moved_rows.append(row)
+            else:
+                kept_rows.append(row)
+
+        if not moved_rows:
+            break
+        moved_units = sum(int(r.get("qty") or 0) for r in moved_rows)
+        picker_state[src]["rows"] = kept_rows
+        picker_state[src]["sku_count"] -= len(moved_rows)
+        picker_state[src]["units"] -= moved_units
+        picker_state[dst]["rows"].extend(moved_rows)
+        picker_state[dst]["sku_count"] += len(moved_rows)
+        picker_state[dst]["units"] += moved_units
+
+    # Métricas y control de familias realmente divididas en carga de PDA (excluye CORTES).
+    family_picker_map = {}
+    for pi, state in enumerate(picker_state):
+        for row in state["rows"]:
+            if bool(row.get("is_corte", False)):
+                continue
+            fam = str(row.get("family") or "Sin Familia")
+            family_picker_map.setdefault(fam, set()).add(pi)
+
+    split_family_names = sorted([fam for fam, pis in family_picker_map.items() if len(pis) > 1])
+    total_families = len(family_picker_map)
+
+    sku_counts = [int(x["sku_count"]) for x in picker_state]
+    unit_counts = [int(x["units"]) for x in picker_state]
+    avg_skus = (sum(sku_counts) / n) if n else 0.0
+    avg_units = (sum(unit_counts) / n) if n else 0.0
+    # Desviación máxima respecto del objetivo/promedio. Así un rango 18–27 con
+    # objetivo 22,5 se informa como 20% (no como 40% entre extremos).
+    sku_imbalance = (max(abs(x - avg_skus) for x in sku_counts) / avg_skus * 100.0) if avg_skus > 0 else 0.0
+    unit_imbalance = (max(abs(x - avg_units) for x in unit_counts) / avg_units * 100.0) if avg_units > 0 else 0.0
+
+    weighted_deviations = []
+    for state in picker_state:
+        sku_dev = abs(state["sku_count"] - target_skus) / target_skus if target_skus > 0 else 0.0
+        unit_dev = abs(state["units"] - target_units) / target_units if target_units > 0 else 0.0
+        weighted_deviations.append((SKU_BALANCE_WEIGHT * sku_dev) + (UNIT_BALANCE_WEIGHT * unit_dev))
+    max_weighted_dev = max(weighted_deviations) if weighted_deviations else 0.0
+
+    if total_skus == 0:
+        quality = "Sin carga de picking"
+    elif max_weighted_dev <= 0.20:
+        quality = "Buena"
+    elif max_weighted_dev <= 0.35:
+        quality = "Aceptable"
+    else:
+        quality = "Revisar"
+
+    summary_rows = []
+    for state in picker_state:
+        fams = sorted({
+            str(row.get("family") or "Sin Familia")
+            for row in state["rows"]
+            if not bool(row.get("is_corte", False))
+        })
+        load_pct = _normalized_picker_load(state["sku_count"], state["units"], target_skus, target_units) * 100.0
+        summary_rows.append({
+            "Picker": state["name"],
+            "SKU": int(state["sku_count"]),
+            "Unidades": int(state["units"]),
+            "Familias": len(fams),
+            "Detalle familias": ", ".join(fams) if fams else "-",
+            "Carga estimada": f"{load_pct:.0f}%",
+        })
+
+    return {
+        "assignments": [state["rows"] for state in picker_state],
+        "title_ml_by_sku": title_ml_by_sku,
+        "summary": pd.DataFrame(summary_rows),
+        "metrics": {
+            "total_skus": total_skus,
+            "total_units": total_units,
+            "total_families": total_families,
+            "split_families": len(split_family_names),
+            "split_family_names": split_family_names,
+            "avg_skus": avg_skus,
+            "avg_units": avg_units,
+            "min_skus": min(sku_counts) if sku_counts else 0,
+            "max_skus": max(sku_counts) if sku_counts else 0,
+            "min_units": min(unit_counts) if unit_counts else 0,
+            "max_units": max(unit_counts) if unit_counts else 0,
+            "sku_imbalance_pct": sku_imbalance,
+            "unit_imbalance_pct": unit_imbalance,
+            "max_weighted_deviation_pct": max_weighted_dev * 100.0,
+            "quality": quality,
+        },
+    }
+
+
+def _render_sku_distribution_preview(plan: dict):
+    """Panel visual de validación previo a crear las OTs."""
+    metrics = plan.get("metrics") or {}
+    summary = plan.get("summary")
+
+    st.subheader("Distribución propuesta por familia")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("SKU de picking", int(metrics.get("total_skus", 0) or 0))
+    c2.metric("Unidades", int(metrics.get("total_units", 0) or 0))
+    c3.metric("Familias", int(metrics.get("total_families", 0) or 0))
+    c4.metric("Familias divididas", int(metrics.get("split_families", 0) or 0))
+
+    if isinstance(summary, pd.DataFrame) and not summary.empty:
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    st.caption(
+        f"Objetivo dinámico: {float(metrics.get('avg_skus', 0.0)):.1f} SKU y "
+        f"{float(metrics.get('avg_units', 0.0)):.1f} unidades por picker. "
+        f"Rango SKU: {int(metrics.get('min_skus', 0))}–{int(metrics.get('max_skus', 0))}. "
+        f"Desviación máx. SKU: {float(metrics.get('sku_imbalance_pct', 0.0)):.1f}% · "
+        f"Desviación máx. unidades: {float(metrics.get('unit_imbalance_pct', 0.0)):.1f}%."
+    )
+
+    quality = str(metrics.get("quality") or "").strip()
+    if quality == "Buena":
+        st.success("Calidad del reparto: BUENA. Se priorizaron las familias manteniendo una carga equilibrada.")
+    elif quality == "Aceptable":
+        st.info("Calidad del reparto: ACEPTABLE. La estructura de familias limita un balance más exacto sin fragmentarlas de más.")
+    elif quality == "Revisar":
+        st.warning("Calidad del reparto: REVISAR. Hay SKU o familias cuya carga individual dificulta igualar más a los pickers.")
+    elif quality:
+        st.info(f"Calidad del reparto: {quality}.")
+
+    split_names = metrics.get("split_family_names") or []
+    if split_names:
+        st.caption("Familias divididas sólo por balance: " + ", ".join(map(str, split_names)))
+    else:
+        st.caption("No fue necesario dividir ninguna familia para esta carga.")
+
+
+def _filter_sales_not_loaded_for_preview(sales_df: pd.DataFrame) -> pd.DataFrame:
+    """Replica para la vista previa el filtro de ventas ya cargadas usado al anexar tandas."""
+    if sales_df is None or sales_df.empty or "ml_order_id" not in sales_df.columns:
+        return sales_df.copy() if isinstance(sales_df, pd.DataFrame) else pd.DataFrame()
+
+    work = sales_df.copy()
+    work["ml_order_id"] = work["ml_order_id"].astype(str).str.strip()
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT DISTINCT TRIM(o.ml_order_id)
+            FROM ot_orders oo
+            JOIN orders o ON o.id = oo.order_id
+        """)
+        existing = {str(r[0]).strip() for r in c.fetchall() if str(r[0]).strip()}
+    except Exception:
+        existing = set()
+    conn.close()
+    return work[~work["ml_order_id"].isin(existing)].copy()
+
 def save_orders_and_build_ots(
     sales_df: pd.DataFrame,
     inv_map_sku: dict,
@@ -1887,98 +2431,38 @@ def save_orders_and_build_ots(
         conn.close()
         return
 
-    # === Modelo nuevo: por SKU + Familia ===
-    # 1) Preparar totales por SKU y familia
-    dfw = sales_df.copy()
-    dfw["sku_ml"] = dfw["sku_ml"].map(normalize_sku)
-    dfw = dfw[dfw["sku_ml"].ne("")].copy()
+    # === Modelo por SKU + Familia: prioridad familia + balance dinámico ===
+    # El planificador trabaja con N pickers, conserva cada SKU completo y sólo divide
+    # una familia cuando mantenerla íntegra rompe el balance objetivo.
+    picker_names = [f"P{i+1}" for i in range(len(ot_ids))]
+    plan = _plan_sku_family_distribution(
+        sales_df,
+        len(ot_ids),
+        familia_map_sku=familia_map_sku,
+        cortes_set=cortes_set,
+        picker_names=picker_names,
+    )
+    title_ml_by_sku = plan.get("title_ml_by_sku") or {}
+    assigned_rows = plan.get("assignments") or []
 
-    # título ML preferido por SKU (si no hay título técnico)
-    title_ml_by_sku = {}
-    if "title_ml" in dfw.columns:
-        for sku, g in dfw.groupby("sku_ml"):
-            t = ""
-            for v in g["title_ml"].tolist():
-                v = str(v or "").strip()
-                if v and v.lower() != "nan":
-                    t = v
-                    break
-            title_ml_by_sku[sku] = t
+    # Insertar exactamente los SKU asignados a cada OT. Un SKU nunca se duplica entre OTs.
+    for ot_pos, ot_id in enumerate(ot_ids):
+        rows = assigned_rows[ot_pos] if ot_pos < len(assigned_rows) else []
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                str(r.get("family") or ""),
+                int(str(r.get("sku_ml"))) if str(r.get("sku_ml", "")).isdigit() else 10**18,
+                str(r.get("sku_ml") or ""),
+            ),
+        )
 
-        # Prefijo 6 -> Familia para inferir SKUs sin familia
-        _fam_prefix6 = {}
-        try:
-            fam_counts = {}
-            for k, v in (familia_map_sku or {}).items():
-                base_sku = normalize_sku(k)
-                fam = str(v or "").strip()
-                if not base_sku or len(base_sku) < 6 or not fam or fam.lower() == "nan":
-                    continue
-                pref6 = base_sku[:6]
-                fam_counts.setdefault(pref6, {})
-                fam_counts[pref6][fam] = fam_counts[pref6].get(fam, 0) + 1
-
-            for pref6, fam_map in fam_counts.items():
-                _fam_prefix6[pref6] = sorted(
-                    fam_map.items(),
-                    key=lambda kv: (-kv[1], kv[0])
-                )[0][0]
-        except Exception:
-            _fam_prefix6 = {}
-
-    def _fam_for_sku(sku: str) -> str:
-        # 1) Familia directa en maestro
-        f = str(familia_map_sku.get(sku, "") or "").strip()
-        if f and f.lower() != "nan":
-            return f
-
-        # 2) Fallback: usar los primeros 6 dígitos del SKU
-        ssku = normalize_sku(sku)
-        if not ssku:
-            return "Sin Familia"
-
-        fam6 = _fam_prefix6.get(ssku[:6], "")
-        if fam6:
-            return fam6
-
-        return "Sin Familia"
-
-    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
-
-    # totales por familia+sku
-    grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
-    grp["qty"] = grp["qty"].astype(int)
-
-    # 2) asignar familias a OTs (greedy balance por unidades)
-    fam_weights = grp.groupby("family")["qty"].sum().to_dict()
-    fam_list = sorted(fam_weights.items(), key=lambda x: x[1], reverse=True)
-
-    ot_load = {ot_id: 0 for ot_id in ot_ids}
-    ot_fams = {ot_id: [] for ot_id in ot_ids}
-
-    for fam, w in fam_list:
-        # ot menos cargada
-        target_ot = min(ot_load.items(), key=lambda kv: kv[1])[0]
-        ot_fams[target_ot].append(fam)
-        ot_load[target_ot] += int(w or 0)
-
-    # 3) Insertar tareas por OT
-    for ot_id in ot_ids:
-        fams = ot_fams.get(ot_id, [])
-        if not fams:
-            continue
-        sub = grp[grp["family"].isin(fams)].copy()
-        # orden: familia, sku
-        try:
-            sub["sku_int"] = sub["sku_ml"].map(lambda x: int(x) if str(x).isdigit() else 10**18)
-            sub = sub.sort_values(["family", "sku_int", "sku_ml"], ascending=[True, True, True])
-        except Exception:
-            sub = sub.sort_values(["family", "sku_ml"], ascending=[True, True])
-
-        for _, r in sub.iterrows():
-            fam = str(r["family"])
-            sku = str(r["sku_ml"])
-            total = int(r["qty"] or 0)
+        for r in rows:
+            fam = str(r.get("family") or "Sin Familia")
+            sku = normalize_sku(r.get("sku_ml"))
+            total = int(r.get("qty") or 0)
+            if not sku or total <= 0:
+                continue
             title_tec = inv_map_sku.get(sku, "") or ""
             title_ml = title_ml_by_sku.get(sku, "") or ""
             title_eff = title_tec.strip() if title_tec.strip() else title_ml.strip()
@@ -2133,77 +2617,33 @@ def append_orders_and_build_ots(
         conn.close()
         return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_label": batch_label}
 
-    dfw = sales_df.copy()
-    dfw["sku_ml"] = dfw["sku_ml"].map(normalize_sku)
-    dfw = dfw[dfw["sku_ml"].ne("")].copy()
+    # Modelo SKU/Familia con el mismo planificador usado por la vista previa.
+    plan = _plan_sku_family_distribution(
+        sales_df,
+        len(ot_ids),
+        familia_map_sku=familia_map_sku,
+        cortes_set=cortes_set,
+        picker_names=picker_names,
+    )
+    title_ml_by_sku = plan.get("title_ml_by_sku") or {}
+    assigned_rows = plan.get("assignments") or []
 
-    title_ml_by_sku = {}
-    if "title_ml" in dfw.columns:
-        for sku, g in dfw.groupby("sku_ml"):
-            t = ""
-            for v in g["title_ml"].tolist():
-                v = str(v or "").strip()
-                if v and v.lower() != "nan":
-                    t = v
-                    break
-            title_ml_by_sku[sku] = t
-
-    _fam_prefix6 = {}
-    try:
-        fam_counts = {}
-        for k, v in (familia_map_sku or {}).items():
-            base_sku = normalize_sku(k)
-            fam = str(v or "").strip()
-            if not base_sku or len(base_sku) < 6 or not fam or fam.lower() == "nan":
+    for ot_pos, ot_id in enumerate(ot_ids):
+        rows = assigned_rows[ot_pos] if ot_pos < len(assigned_rows) else []
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                str(r.get("family") or ""),
+                int(str(r.get("sku_ml"))) if str(r.get("sku_ml", "")).isdigit() else 10**18,
+                str(r.get("sku_ml") or ""),
+            ),
+        )
+        for r in rows:
+            fam = str(r.get("family") or "Sin Familia")
+            sku = normalize_sku(r.get("sku_ml"))
+            total = int(r.get("qty") or 0)
+            if not sku or total <= 0:
                 continue
-            pref6 = base_sku[:6]
-            fam_counts.setdefault(pref6, {})
-            fam_counts[pref6][fam] = fam_counts[pref6].get(fam, 0) + 1
-        for pref6, fam_map in fam_counts.items():
-            _fam_prefix6[pref6] = sorted(fam_map.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-    except Exception:
-        _fam_prefix6 = {}
-
-    def _fam_for_sku(sku: str) -> str:
-        f = str(familia_map_sku.get(sku, "") or "").strip()
-        if f and f.lower() != "nan":
-            return f
-        ssku = normalize_sku(sku)
-        if not ssku:
-            return "Sin Familia"
-        fam6 = _fam_prefix6.get(ssku[:6], "")
-        if fam6:
-            return fam6
-        return "Sin Familia"
-
-    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
-    grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
-    grp["qty"] = grp["qty"].astype(int)
-
-    fam_weights = grp.groupby("family")["qty"].sum().to_dict()
-    fam_list = sorted(fam_weights.items(), key=lambda x: x[1], reverse=True)
-    ot_load = {ot_id: 0 for ot_id in ot_ids}
-    ot_fams = {ot_id: [] for ot_id in ot_ids}
-    for fam, w in fam_list:
-        target_ot = min(ot_load.items(), key=lambda kv: kv[1])[0]
-        ot_fams[target_ot].append(fam)
-        ot_load[target_ot] += int(w or 0)
-
-    for ot_id in ot_ids:
-        fams = ot_fams.get(ot_id, [])
-        if not fams:
-            continue
-        sub = grp[grp["family"].isin(fams)].copy()
-        try:
-            sub["sku_int"] = sub["sku_ml"].map(lambda x: int(x) if str(x).isdigit() else 10**18)
-            sub = sub.sort_values(["family", "sku_int", "sku_ml"], ascending=[True, True, True])
-        except Exception:
-            sub = sub.sort_values(["family", "sku_ml"], ascending=[True, True])
-
-        for _, r in sub.iterrows():
-            fam = str(r["family"])
-            sku = str(r["sku_ml"])
-            total = int(r["qty"] or 0)
             title_tec = inv_map_sku.get(sku, "") or ""
             title_ml = title_ml_by_sku.get(sku, "") or ""
             title_eff = title_tec.strip() if title_tec.strip() else title_ml.strip()
@@ -2335,6 +2775,22 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
 
     st.subheader("Vista previa")
     st.dataframe(sales_df.head(30))
+
+    # Vista previa operativa sólo para el modelo Por SKU. Usa exactamente el mismo
+    # planificador que luego escribe las tareas, por lo que el reparto mostrado es el real.
+    if model_pick.startswith("Por sku"):
+        preview_sales_df = _filter_sales_not_loaded_for_preview(sales_df) if batches else sales_df.copy()
+        if preview_sales_df.empty:
+            st.warning("No hay ventas nuevas para repartir en esta carga.")
+        else:
+            preview_plan = _plan_sku_family_distribution(
+                preview_sales_df,
+                int(num_pickers),
+                familia_map_sku=familia_map_sku,
+                cortes_set=load_cortes_set(),
+                picker_names=next_names,
+            )
+            _render_sku_distribution_preview(preview_plan)
 
     action_label = "Agregar carga y generar nuevas OTs" if batches else "Cargar y generar OTs"
     if st.button(action_label):
