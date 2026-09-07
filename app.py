@@ -7946,8 +7946,10 @@ def main():
                 st.sidebar.warning(f"Rescate Sheets: {recovery_msg}")
 
         if _picking_recovery_is_active():
-            st.warning("☁️ Recuperando Picking desde Sheets. Otro dispositivo inició el rescate; esta pantalla se habilitará al terminar.")
-            st.stop()
+            st.warning("☁️ Recuperando Picking desde Sheets. Otro dispositivo inició el rescate; esta pantalla se actualizará automáticamente al terminar.")
+            st.caption("No necesitas presionar F5. Verificando nuevamente en 2 segundos…")
+            time.sleep(2)
+            st.rerun()
 
         recovery_flash = st.session_state.pop("picking_recovery_flash", None)
         if recovery_flash:
