@@ -17,6 +17,10 @@ import math
 import random
 import string
 import requests
+import time
+import uuid
+import hashlib
+import threading
 from contextlib import contextmanager
 # =========================
 # CONFIG
@@ -24,6 +28,16 @@ from contextlib import contextmanager
 DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
+
+# Respaldo persistente PICKING. Se usa el mismo webhook operativo del WMS FULL,
+# pero puede reemplazarse mediante Streamlit Secrets o variable de entorno
+# PICKING_SHEETS_WEBHOOK_URL sin modificar el código.
+DEFAULT_PICKING_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
+PICKING_BACKUP_MAX_ATTEMPTS = 8
+PICKING_BACKUP_WORKER_LIMIT = 120
+PICKING_SNAPSHOT_MAX_JSON_BYTES = 30000
+_PICKING_BACKUP_THREAD_LOCK = threading.Lock()
+_PICKING_BACKUP_THREAD_RUNNING = False
 
 
 # =========================
@@ -470,6 +484,1146 @@ def db_exec(sql: str, params: tuple = (), commit: bool = False):
         return cur
 
 
+# ============================================================
+# PICKING — RESPALDO PERSISTENTE GOOGLE SHEETS (SQLite-first)
+# ============================================================
+def _picking_clean(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).replace("\u00a0", " ").strip()
+    if text.lower() in {"nan", "none", "null", "nat"}:
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def get_picking_backup_webhook_url() -> str:
+    """Webhook de respaldo. Secret/env puede reemplazar la URL por defecto."""
+    env_url = _picking_clean(os.getenv("PICKING_SHEETS_WEBHOOK_URL", ""))
+    if env_url:
+        return env_url
+    try:
+        secret_url = _picking_clean(st.secrets.get("PICKING_SHEETS_WEBHOOK_URL", ""))
+        if secret_url:
+            return secret_url
+    except Exception:
+        pass
+    return _picking_clean(DEFAULT_PICKING_SHEETS_WEBHOOK_URL)
+
+
+def _picking_meta_get(key: str, default: str = "") -> str:
+    try:
+        with db_conn(commit=False) as conn:
+            row = conn.execute("SELECT value FROM picking_sync_meta WHERE key=?", (str(key),)).fetchone()
+        return _picking_clean(row[0]) if row else default
+    except Exception:
+        return default
+
+
+def _picking_meta_set(key: str, value: str):
+    try:
+        with db_conn(commit=True) as conn:
+            conn.execute(
+                """INSERT INTO picking_sync_meta(key,value,updated_at) VALUES (?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (str(key), str(value), now_iso()),
+            )
+    except Exception:
+        pass
+
+
+def _make_picking_event_uid(event_type: str, queued_at: str) -> str:
+    return f"PK_EVT:{_picking_clean(event_type)}:{_picking_clean(queued_at)}:{uuid.uuid4().hex}"
+
+
+def _attach_picking_event_identity(event_type: str, payload: dict, queued_at: str) -> dict:
+    out = dict(payload or {})
+    if not _picking_clean(out.get("event_uid")):
+        out["event_uid"] = _make_picking_event_uid(event_type, queued_at)
+    out["event_source"] = "streamlit_picking_aurora"
+    return out
+
+
+def enqueue_picking_backup_event(event_type: str, payload: dict) -> int | None:
+    ids = enqueue_picking_backup_events_batch([(event_type, payload)])
+    return ids[0] if ids else None
+
+
+def enqueue_picking_backup_events_batch(events: list[tuple[str, dict]]) -> list[int]:
+    """Encola eventos localmente; nunca espera a Google Sheets en la operación del PDA."""
+    if not events:
+        return []
+    created_at = now_iso()
+    rows = []
+    for event_type, payload in events:
+        safe_payload = _attach_picking_event_identity(event_type, payload or {}, created_at)
+        rows.append((event_type, json.dumps(safe_payload, ensure_ascii=False, default=str), created_at))
+
+    ids: list[int] = []
+    try:
+        with db_conn(commit=True) as conn:
+            for event_type, payload_json, ts in rows:
+                cur = conn.execute(
+                    """INSERT INTO picking_backup_queue
+                       (event_type,payload_json,status,attempts,created_at)
+                       VALUES (?,?,'pending',0,?)""",
+                    (event_type, payload_json, ts),
+                )
+                ids.append(int(cur.lastrowid))
+    except Exception:
+        return []
+
+    trigger_picking_backup_sync_async(limit=max(PICKING_BACKUP_WORKER_LIMIT, min(120, len(ids) + 10)))
+    return ids
+
+
+def _is_picking_backup_transient(message: str) -> bool:
+    msg = _picking_clean(message).lower()
+    transient_tokens = (
+        "timeout", "timed out", "lock_busy", "apps script ocupado", "script ocupado",
+        "temporarily", "connection reset", "connection aborted", "too many times",
+        "429", "502", "503", "504",
+    )
+    return any(tok in msg for tok in transient_tokens)
+
+
+def _send_picking_webhook_event(url: str, event: dict, timeout: int = 25) -> tuple[bool, str]:
+    try:
+        resp = requests.post(url, json=event, timeout=(5, int(timeout)), allow_redirects=True)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    text = resp.text or ""
+    if not (200 <= int(resp.status_code) < 300):
+        return False, f"HTTP {resp.status_code}: {text[:500]}"
+    try:
+        data = resp.json()
+    except Exception:
+        return False, f"Respuesta no JSON: {text[:500]}"
+    if data.get("ok") is True:
+        return True, text[:500]
+    if data.get("transient") is True or data.get("retry") is True:
+        return False, f"TRANSIENT_APPS_SCRIPT: {text[:500]}"
+    return False, f"Apps Script respondió ok=false: {text[:500]}"
+
+
+def _claim_picking_backup_lease(owner: str, lease_seconds: int = 60) -> bool:
+    """Candado persistente para que 8 sesiones/PDA no creen 8 escritores hacia Sheets."""
+    now_epoch = time.time()
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("BEGIN IMMEDIATE")
+        row_owner = c.execute("SELECT value FROM picking_sync_meta WHERE key='worker_owner'").fetchone()
+        row_until = c.execute("SELECT value FROM picking_sync_meta WHERE key='worker_until'").fetchone()
+        cur_owner = _picking_clean(row_owner[0]) if row_owner else ""
+        try:
+            cur_until = float(row_until[0]) if row_until and row_until[0] not in (None, "") else 0.0
+        except Exception:
+            cur_until = 0.0
+        if cur_owner and cur_owner != owner and cur_until > now_epoch:
+            conn.rollback()
+            conn.close()
+            return False
+        until = str(now_epoch + max(20, int(lease_seconds)))
+        c.execute(
+            """INSERT INTO picking_sync_meta(key,value,updated_at) VALUES ('worker_owner',?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+            (owner, now_iso()),
+        )
+        c.execute(
+            """INSERT INTO picking_sync_meta(key,value,updated_at) VALUES ('worker_until',?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+            (until, now_iso()),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return False
+
+
+def _renew_picking_backup_lease(owner: str, lease_seconds: int = 60):
+    try:
+        with db_conn(commit=True) as conn:
+            row = conn.execute("SELECT value FROM picking_sync_meta WHERE key='worker_owner'").fetchone()
+            if row and _picking_clean(row[0]) == owner:
+                until = str(time.time() + max(20, int(lease_seconds)))
+                conn.execute("UPDATE picking_sync_meta SET value=?,updated_at=? WHERE key='worker_until'", (until, now_iso()))
+    except Exception:
+        pass
+
+
+def _release_picking_backup_lease(owner: str):
+    try:
+        with db_conn(commit=True) as conn:
+            row = conn.execute("SELECT value FROM picking_sync_meta WHERE key='worker_owner'").fetchone()
+            if row and _picking_clean(row[0]) == owner:
+                conn.execute("UPDATE picking_sync_meta SET value='',updated_at=? WHERE key='worker_owner'", (now_iso(),))
+                conn.execute("UPDATE picking_sync_meta SET value='0',updated_at=? WHERE key='worker_until'", (now_iso(),))
+    except Exception:
+        pass
+
+
+def flush_picking_backup_queue(limit: int = 40, include_failed: bool = False) -> int:
+    """Drena la cola en orden, con un solo escritor efectivo hacia Apps Script."""
+    url = get_picking_backup_webhook_url()
+    if not url:
+        return 0
+    owner = uuid.uuid4().hex
+    if not _claim_picking_backup_lease(owner, lease_seconds=180):
+        return 0
+    processed = 0
+    try:
+        statuses = ("pending", "failed") if include_failed else ("pending",)
+        qmarks = ",".join("?" for _ in statuses)
+        while processed < max(1, int(limit)):
+            with db_conn(commit=False) as conn:
+                row = conn.execute(
+                    f"""SELECT id,event_type,payload_json,attempts,created_at,last_error,last_attempt_at
+                        FROM picking_backup_queue
+                        WHERE status IN ({qmarks})
+                        ORDER BY id ASC LIMIT 1""",
+                    statuses,
+                ).fetchone()
+            if not row:
+                break
+            qid, event_type, payload_json, attempts, created_at, last_error, last_attempt_at = row
+            try:
+                payload = json.loads(payload_json or "{}")
+            except Exception:
+                payload = {}
+            event = {
+                "event_type": event_type,
+                "queue_id": int(qid),
+                "queued_at": created_at,
+                **payload,
+            }
+            attempt_at = now_iso()
+            try:
+                with db_conn(commit=True) as conn:
+                    conn.execute("UPDATE picking_backup_queue SET last_attempt_at=? WHERE id=?", (attempt_at, int(qid)))
+            except Exception:
+                pass
+
+            ok, detail = _send_picking_webhook_event(url, event)
+            processed += 1
+            if ok:
+                with db_conn(commit=True) as conn:
+                    conn.execute(
+                        "UPDATE picking_backup_queue SET status='sent',sent_at=?,last_error=NULL WHERE id=?",
+                        (now_iso(), int(qid)),
+                    )
+                if processed % 5 == 0:
+                    _renew_picking_backup_lease(owner, 180)
+                continue
+
+            detail = _picking_clean(detail)[:700]
+            if _is_picking_backup_transient(detail):
+                with db_conn(commit=True) as conn:
+                    conn.execute(
+                        "UPDATE picking_backup_queue SET status='pending',last_error=? WHERE id=?",
+                        (detail, int(qid)),
+                    )
+                break
+
+            attempts_next = int(attempts or 0) + 1
+            new_status = "failed" if attempts_next >= PICKING_BACKUP_MAX_ATTEMPTS else "pending"
+            with db_conn(commit=True) as conn:
+                conn.execute(
+                    "UPDATE picking_backup_queue SET attempts=?,status=?,last_error=? WHERE id=?",
+                    (attempts_next, new_status, detail, int(qid)),
+                )
+            if new_status == "pending":
+                break
+        return processed
+    finally:
+        _release_picking_backup_lease(owner)
+
+
+def _picking_backup_worker(limit: int):
+    global _PICKING_BACKUP_THREAD_RUNNING
+    try:
+        flush_picking_backup_queue(limit=int(limit), include_failed=False)
+    except Exception:
+        pass
+    finally:
+        with _PICKING_BACKUP_THREAD_LOCK:
+            _PICKING_BACKUP_THREAD_RUNNING = False
+
+
+def trigger_picking_backup_sync_async(limit: int = 40) -> bool:
+    """Best-effort en segundo plano: el PDA nunca espera a Sheets."""
+    global _PICKING_BACKUP_THREAD_RUNNING
+    if not get_picking_backup_webhook_url():
+        return False
+    with _PICKING_BACKUP_THREAD_LOCK:
+        if _PICKING_BACKUP_THREAD_RUNNING:
+            return False
+        _PICKING_BACKUP_THREAD_RUNNING = True
+    try:
+        thread = threading.Thread(target=_picking_backup_worker, args=(int(limit),), daemon=True)
+        thread.start()
+        return True
+    except Exception:
+        with _PICKING_BACKUP_THREAD_LOCK:
+            _PICKING_BACKUP_THREAD_RUNNING = False
+        return False
+
+
+def get_picking_backup_status() -> dict:
+    try:
+        with db_conn(commit=False) as conn:
+            row = conn.execute(
+                """SELECT
+                    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),
+                    MAX(sent_at), MAX(last_error)
+                   FROM picking_backup_queue"""
+            ).fetchone()
+        return {
+            "pending": int((row[0] if row else 0) or 0),
+            "sent": int((row[1] if row else 0) or 0),
+            "failed": int((row[2] if row else 0) or 0),
+            "last_sent": (row[3] if row else "") or "",
+            "last_error": (row[4] if row else "") or "",
+        }
+    except Exception:
+        return {"pending": 0, "sent": 0, "failed": 0, "last_sent": "", "last_error": ""}
+
+
+def _picking_batch_context(batch_key: str) -> dict:
+    batch_key = _picking_clean(batch_key)
+    if not batch_key:
+        return {}
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """SELECT po.batch_key,MAX(COALESCE(NULLIF(po.batch_label,''),po.ot_code)) AS batch_label,
+                      MIN(po.created_at) AS created_at,MAX(COALESCE(po.model,'SKU')) AS model,
+                      COUNT(DISTINCT po.id) AS ot_count,COUNT(DISTINCT pk.name) AS picker_count,
+                      GROUP_CONCAT(DISTINCT pk.name) AS picker_names
+                 FROM picking_ots po JOIN pickers pk ON pk.id=po.picker_id
+                WHERE po.batch_key=? GROUP BY po.batch_key""",
+            (batch_key,),
+        ).fetchone()
+        if not row:
+            return {}
+        out = dict(row)
+        label = _picking_clean(out.get("batch_label")) or batch_key
+        out["source_label"] = label.split(" · ", 1)[0] if " · " in label else label
+        return out
+    finally:
+        conn.close()
+
+
+def _picking_entity_rows_for_batch(batch_key: str) -> list[dict]:
+    """Snapshot lógico sin ids SQLite; se restaura por OT/SKU/venta y no recalcula reparto."""
+    batch_key = _picking_clean(batch_key)
+    if not batch_key:
+        return []
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    entities: list[dict] = []
+    try:
+        ots = conn.execute(
+            """SELECT po.ot_code,pk.name AS picker_name,po.status,po.created_at,po.closed_at,
+                      COALESCE(po.model,'') AS model,COALESCE(po.batch_key,'') AS batch_key,
+                      COALESCE(po.batch_label,'') AS batch_label
+                 FROM picking_ots po JOIN pickers pk ON pk.id=po.picker_id
+                WHERE po.batch_key=? ORDER BY po.id""",
+            (batch_key,),
+        ).fetchall()
+        ot_codes = [_picking_clean(r["ot_code"]) for r in ots]
+        for r in ots:
+            entities.append({"entity": "ot", **dict(r)})
+        if not ot_codes:
+            return entities
+        qmarks = ",".join("?" for _ in ot_codes)
+
+        orders = conn.execute(
+            f"""SELECT DISTINCT o.ml_order_id,o.buyer,o.created_at
+                  FROM ot_orders oo JOIN picking_ots po ON po.id=oo.ot_id JOIN orders o ON o.id=oo.order_id
+                 WHERE po.ot_code IN ({qmarks}) ORDER BY o.id""",
+            ot_codes,
+        ).fetchall()
+        for r in orders:
+            entities.append({"entity": "order", **dict(r)})
+
+        order_ids = [_picking_clean(r["ml_order_id"]) for r in orders]
+        if order_ids:
+            oq = ",".join("?" for _ in order_ids)
+            rows = conn.execute(
+                f"""SELECT o.ml_order_id,oi.sku_ml,oi.title_ml,oi.title_tec,oi.qty
+                      FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                     WHERE o.ml_order_id IN ({oq}) ORDER BY oi.id""",
+                order_ids,
+            ).fetchall()
+            for r in rows:
+                entities.append({"entity": "order_item", **dict(r)})
+
+        rows = conn.execute(
+            f"""SELECT po.ot_code,o.ml_order_id
+                  FROM ot_orders oo JOIN picking_ots po ON po.id=oo.ot_id JOIN orders o ON o.id=oo.order_id
+                 WHERE po.ot_code IN ({qmarks}) ORDER BY oo.id""",
+            ot_codes,
+        ).fetchall()
+        for r in rows:
+            entities.append({"entity": "ot_order", **dict(r)})
+
+        rows = conn.execute(
+            f"""SELECT po.ot_code,pt.sku_ml,pt.title_ml,pt.title_tec,pt.qty_total,pt.qty_picked,pt.status,
+                       pt.decided_at,pt.confirm_mode,COALESCE(pt.defer_rank,0) AS defer_rank,pt.defer_at,
+                       COALESCE(pt.family,'') AS family
+                  FROM picking_tasks pt JOIN picking_ots po ON po.id=pt.ot_id
+                 WHERE po.ot_code IN ({qmarks}) ORDER BY pt.id""",
+            ot_codes,
+        ).fetchall()
+        for r in rows:
+            entities.append({"entity": "task", **dict(r)})
+
+        rows = conn.execute(
+            f"""SELECT po.ot_code,pi.sku_ml,pi.qty_total,pi.qty_picked,pi.qty_missing,pi.reason,
+                       COALESCE(pi.note,'') AS note,pi.created_at
+                  FROM picking_incidences pi JOIN picking_ots po ON po.id=pi.ot_id
+                 WHERE po.ot_code IN ({qmarks}) ORDER BY pi.id""",
+            ot_codes,
+        ).fetchall()
+        for r in rows:
+            entities.append({"entity": "incidence", **dict(r)})
+
+        rows = conn.execute(
+            f"""SELECT po.ot_code,ct.sku_ml,ct.title_ml,ct.title_tec,ct.qty_total,ct.created_at
+                  FROM cortes_tasks ct JOIN picking_ots po ON po.id=ct.ot_id
+                 WHERE po.ot_code IN ({qmarks}) ORDER BY ct.id""",
+            ot_codes,
+        ).fetchall()
+        for r in rows:
+            entities.append({"entity": "corte", **dict(r)})
+    finally:
+        conn.close()
+    return entities
+
+
+def _chunk_picking_entities(entities: list[dict], max_bytes: int = PICKING_SNAPSHOT_MAX_JSON_BYTES) -> list[list[dict]]:
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_size = 2
+    for entity in entities:
+        encoded = json.dumps(entity, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8")
+        item_size = len(encoded) + 1
+        if current and current_size + item_size > max(8000, int(max_bytes)):
+            chunks.append(current)
+            current = []
+            current_size = 2
+        current.append(entity)
+        current_size += item_size
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def queue_picking_batch_snapshot(batch_key: str, motivo: str = "AUTO", include_lote_created: bool = False) -> list[int]:
+    """Guarda estructura y progreso actual del lote en chunks seguros para Sheets."""
+    ctx = _picking_batch_context(batch_key)
+    if not ctx:
+        return []
+    entities = _picking_entity_rows_for_batch(batch_key)
+    tasks = [x for x in entities if x.get("entity") == "task"]
+    cortes = [x for x in entities if x.get("entity") == "corte"]
+    total_units = sum(int(x.get("qty_total") or 0) for x in tasks + cortes)
+    stable = json.dumps(entities, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    snapshot_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
+    chunks = _chunk_picking_entities(entities)
+    ts = now_iso()
+    batch_label = _picking_clean(ctx.get("batch_label")) or batch_key
+    base = {
+        "lote_id": batch_key,
+        "lote_nombre": batch_label,
+        "backup_lote_key": batch_key,
+        "lote_created_at": _picking_clean(ctx.get("created_at")),
+        "archivo": _picking_clean(ctx.get("source_label")),
+        "hoja": "PICKING",
+        "model": _picking_clean(ctx.get("model")),
+        "picker_count": int(ctx.get("picker_count") or 0),
+        "picker_names": _picking_clean(ctx.get("picker_names")),
+        "created_at": ts,
+    }
+    events: list[tuple[str, dict]] = []
+    if include_lote_created:
+        status = "CERRADO" if ctx and all(
+            _picking_clean(x.get("status")).upper() == "PICKED"
+            for x in entities if x.get("entity") == "ot"
+        ) else "ACTIVO"
+        events.append(("lote_creado", {
+            **base,
+            "total_lineas": len(tasks),
+            "total_unidades": total_units,
+            "status": status,
+            "snapshot_mode": "PICKING_SQLITE_CHUNKS_V1",
+        }))
+    for idx, items in enumerate(chunks, start=1):
+        events.append(("lote_snapshot_chunk", {
+            **base,
+            "snapshot_kind": "PICKING_SQLITE_V1",
+            "motivo_snapshot": _picking_clean(motivo) or "AUTO",
+            "chunk_index": idx,
+            "chunk_total": len(chunks),
+            "productos_total": len(tasks),
+            "unidades_total": total_units,
+            "snapshot_hash": snapshot_hash,
+            "items": items,
+        }))
+    events.append(("lote_snapshot_completo", {
+        **base,
+        "snapshot_kind": "PICKING_SQLITE_V1",
+        "motivo_snapshot": _picking_clean(motivo) or "AUTO",
+        "chunk_index": len(chunks),
+        "chunk_total": len(chunks),
+        "productos_total": len(tasks),
+        "unidades_total": total_units,
+        "snapshot_hash": snapshot_hash,
+    }))
+    return enqueue_picking_backup_events_batch(events)
+
+
+def _picking_task_payload(task_id: int) -> dict:
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """SELECT pt.id,po.batch_key,po.batch_label,po.ot_code,pk.name AS picker_name,
+                      pt.sku_ml,pt.title_ml,pt.title_tec,pt.qty_total,pt.qty_picked,pt.status,
+                      pt.decided_at,pt.confirm_mode,COALESCE(pt.defer_rank,0) AS defer_rank,
+                      pt.defer_at,COALESCE(pt.family,'') AS family,po.created_at AS lote_created_at
+                 FROM picking_tasks pt JOIN picking_ots po ON po.id=pt.ot_id
+                 JOIN pickers pk ON pk.id=po.picker_id WHERE pt.id=?""",
+            (int(task_id),),
+        ).fetchone()
+        if not row or not _picking_clean(row["batch_key"]):
+            return {}
+        d = dict(row)
+        batch_key = _picking_clean(d.get("batch_key"))
+        return {
+            **d,
+            "lote_id": batch_key,
+            "lote_nombre": _picking_clean(d.get("batch_label")) or batch_key,
+            "backup_lote_key": batch_key,
+            "created_at": now_iso(),
+        }
+    finally:
+        conn.close()
+
+
+def queue_picking_task_state(task_id: int) -> int | None:
+    payload = _picking_task_payload(task_id)
+    return enqueue_picking_backup_event("picking_task_state", payload) if payload else None
+
+
+def _picking_incidence_payload(incidence_id: int) -> dict:
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """SELECT pi.id,po.batch_key,po.batch_label,po.ot_code,pk.name AS picker_name,
+                      pi.sku_ml,pi.qty_total,pi.qty_picked,pi.qty_missing,pi.reason,
+                      COALESCE(pi.note,'') AS note,pi.created_at AS incidence_created_at,
+                      po.created_at AS lote_created_at
+                 FROM picking_incidences pi JOIN picking_ots po ON po.id=pi.ot_id
+                 JOIN pickers pk ON pk.id=po.picker_id WHERE pi.id=?""",
+            (int(incidence_id),),
+        ).fetchone()
+        if not row or not _picking_clean(row["batch_key"]):
+            return {}
+        d = dict(row)
+        batch_key = _picking_clean(d.get("batch_key"))
+        d.update({
+            "lote_id": batch_key,
+            "lote_nombre": _picking_clean(d.get("batch_label")) or batch_key,
+            "backup_lote_key": batch_key,
+            "created_at": now_iso(),
+        })
+        return d
+    finally:
+        conn.close()
+
+
+def queue_picking_incidence_state(incidence_id: int) -> int | None:
+    payload = _picking_incidence_payload(incidence_id)
+    return enqueue_picking_backup_event("picking_incidence_state", payload) if payload else None
+
+
+def _picking_ot_payload(ot_id: int) -> dict:
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """SELECT po.id,po.batch_key,po.batch_label,po.ot_code,pk.name AS picker_name,
+                      po.status,po.created_at AS ot_created_at,po.closed_at,COALESCE(po.model,'') AS model
+                 FROM picking_ots po JOIN pickers pk ON pk.id=po.picker_id WHERE po.id=?""",
+            (int(ot_id),),
+        ).fetchone()
+        if not row or not _picking_clean(row["batch_key"]):
+            return {}
+        d = dict(row)
+        batch_key = _picking_clean(d.get("batch_key"))
+        d.update({
+            "lote_id": batch_key,
+            "lote_nombre": _picking_clean(d.get("batch_label")) or batch_key,
+            "backup_lote_key": batch_key,
+            "created_at": now_iso(),
+        })
+        return d
+    finally:
+        conn.close()
+
+
+def queue_picking_ot_state(ot_id: int) -> int | None:
+    payload = _picking_ot_payload(ot_id)
+    return enqueue_picking_backup_event("picking_ot_state", payload) if payload else None
+
+
+def queue_picking_batch_closed_if_complete(batch_key: str):
+    batch_key = _picking_clean(batch_key)
+    if not batch_key:
+        return
+    ctx = _picking_batch_context(batch_key)
+    if not ctx:
+        return
+    try:
+        with db_conn(commit=False) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM picking_ots WHERE batch_key=? AND status<>'PICKED'",
+                (batch_key,),
+            ).fetchone()
+        if int((row[0] if row else 0) or 0) == 0:
+            enqueue_picking_backup_event("lote_cerrado", {
+                "lote_id": batch_key,
+                "lote_nombre": _picking_clean(ctx.get("batch_label")) or batch_key,
+                "backup_lote_key": batch_key,
+                "lote_created_at": _picking_clean(ctx.get("created_at")),
+                "archivo": _picking_clean(ctx.get("source_label")),
+                "hoja": "PICKING",
+                "status": "CERRADO",
+                "usuario": "SISTEMA",
+                "created_at": now_iso(),
+            })
+    except Exception:
+        pass
+
+
+def _read_picking_sheets_json(params: dict, timeout: int = 40, attempts: int = 3) -> tuple[bool, dict, str]:
+    url = get_picking_backup_webhook_url()
+    if not url:
+        return False, {}, "No hay webhook de respaldo configurado."
+    last_error = ""
+    for attempt in range(max(1, int(attempts))):
+        try:
+            resp = requests.get(url, params=params, timeout=(5, int(timeout)), allow_redirects=True)
+            text = resp.text or ""
+            if not (200 <= int(resp.status_code) < 300):
+                raise RuntimeError(f"HTTP {resp.status_code}: {text[:500]}")
+            data = resp.json()
+            if data.get("ok") is not True:
+                return False, data if isinstance(data, dict) else {}, f"Apps Script respondió error: {text[:500]}"
+            return True, data, "OK"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt + 1 < max(1, int(attempts)):
+                time.sleep(0.6 + attempt * 0.8)
+    return False, {}, last_error
+
+
+def get_picking_backup_lotes_from_sheets() -> tuple[bool, list[dict], str]:
+    ok, data, msg = _read_picking_sheets_json({"action": "lotes"}, timeout=35, attempts=2)
+    if not ok:
+        return False, [], msg
+    rows = []
+    for raw in data.get("lotes") or []:
+        r = dict(raw or {})
+        key = _picking_clean(r.get("backup_lote_key")) or _picking_clean(r.get("lote_id"))
+        if not key.startswith("PK-"):
+            continue
+        r["backup_lote_key"] = key
+        rows.append(r)
+    rows.sort(key=lambda r: _picking_clean(r.get("ultimo_evento") or r.get("created_at")), reverse=True)
+    return True, rows, f"Lotes Picking disponibles: {len(rows)}"
+
+
+def get_picking_backup_events_from_sheets(batch_key: str, max_pages: int = 120) -> tuple[bool, list[dict], str]:
+    batch_key = _picking_clean(batch_key)
+    if not batch_key:
+        return False, [], "Lote sin batch_key."
+    events: list[dict] = []
+    cursor = ""
+    seen = set()
+    for page in range(max(1, int(max_pages))):
+        params = {
+            "action": "events",
+            "backup_lote_key": batch_key,
+            "lote_id": batch_key,
+            "page_size": 750,
+            "scan_rows": 10000,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        ok, data, msg = _read_picking_sheets_json(params, timeout=45, attempts=3)
+        if not ok:
+            return False, events, msg
+        events.extend(data.get("events") or [])
+        nxt = _picking_clean(data.get("next_cursor"))
+        if not nxt:
+            return True, events, f"Eventos leídos: {len(events)}"
+        if nxt in seen:
+            return False, events, "Apps Script repitió cursor; rescate detenido por seguridad."
+        seen.add(nxt)
+        cursor = nxt
+    return False, events, f"Rescate excedió {max_pages} páginas."
+
+
+def _normalize_picking_sheet_event(raw: dict) -> dict:
+    out = dict(raw or {})
+    raw_json = out.get("raw_json")
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+            if isinstance(parsed, dict):
+                out.update(parsed)
+        except Exception:
+            pass
+    return out
+
+
+def _picking_event_ts(ev: dict) -> str:
+    return _picking_clean(ev.get("created_at")) or _picking_clean(ev.get("queued_at")) or _picking_clean(ev.get("received_at"))
+
+
+def _dedupe_picking_sheet_events(events: list[dict]) -> list[dict]:
+    seen = set()
+    out = []
+    for raw in events or []:
+        ev = _normalize_picking_sheet_event(raw)
+        key = _picking_clean(ev.get("event_key"))
+        uid = _picking_clean(ev.get("event_uid"))
+        ident = f"KEY:{key}" if key else (f"UID:{uid}" if uid else "SEM:" + "|".join([
+            _picking_clean(ev.get("event_type")), _picking_event_ts(ev),
+            _picking_clean(ev.get("backup_lote_key")), _picking_clean(ev.get("snapshot_hash")),
+            _picking_clean(ev.get("chunk_index")), _picking_clean(ev.get("ot_code")),
+            _picking_clean(ev.get("sku_ml")), _picking_clean(ev.get("status")),
+            _picking_clean(ev.get("incidence_created_at")),
+        ]))
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(ev)
+    out.sort(key=lambda x: (_picking_event_ts(x), _picking_clean(x.get("event_uid"))))
+    return out
+
+
+def _select_latest_picking_snapshot(events: list[dict]) -> tuple[list[dict], str, str, int]:
+    groups: dict[str, dict] = {}
+    for ev in events:
+        if _picking_clean(ev.get("event_type")).lower() != "lote_snapshot_chunk":
+            continue
+        if _picking_clean(ev.get("snapshot_kind")) != "PICKING_SQLITE_V1":
+            continue
+        snap_hash = _picking_clean(ev.get("snapshot_hash"))
+        if not snap_hash:
+            continue
+        try:
+            idx = int(ev.get("chunk_index") or 0)
+            total = int(ev.get("chunk_total") or 0)
+        except Exception:
+            continue
+        if idx <= 0 or total <= 0:
+            continue
+        g = groups.setdefault(snap_hash, {"chunks": {}, "total": total, "ts": "", "order": 0})
+        g["chunks"][idx] = ev
+        g["total"] = max(int(g.get("total") or 0), total)
+        g["ts"] = max(_picking_clean(g.get("ts")), _picking_event_ts(ev))
+        try:
+            g["order"] = max(int(g.get("order") or 0), int(ev.get("queue_id") or 0))
+        except Exception:
+            pass
+    candidates = []
+    for snap_hash, g in groups.items():
+        total = int(g.get("total") or 0)
+        if total > 0 and all(i in g["chunks"] for i in range(1, total + 1)):
+            candidates.append((_picking_clean(g.get("ts")), int(g.get("order") or 0), snap_hash, g))
+    if not candidates:
+        return [], "", "", 0
+    ts, snap_order, snap_hash, g = max(candidates, key=lambda x: (x[0], x[1], x[2]))
+    entities: list[dict] = []
+    for idx in range(1, int(g["total"]) + 1):
+        items = g["chunks"][idx].get("items") or []
+        if isinstance(items, list):
+            entities.extend([dict(x) for x in items if isinstance(x, dict)])
+    return entities, snap_hash, ts, int(snap_order or 0)
+
+
+def _delete_local_picking_batch(conn, batch_key: str):
+    rows = conn.execute("SELECT id FROM picking_ots WHERE batch_key=?", (batch_key,)).fetchall()
+    ot_ids = [int(r[0]) for r in rows]
+    if not ot_ids:
+        return
+    q = ",".join("?" for _ in ot_ids)
+    order_rows = conn.execute(f"SELECT DISTINCT order_id FROM ot_orders WHERE ot_id IN ({q})", ot_ids).fetchall()
+    order_ids = [int(r[0]) for r in order_rows]
+    conn.execute(f"DELETE FROM picking_incidences WHERE ot_id IN ({q})", ot_ids)
+    conn.execute(f"DELETE FROM cortes_tasks WHERE ot_id IN ({q})", ot_ids)
+    conn.execute(f"DELETE FROM picking_tasks WHERE ot_id IN ({q})", ot_ids)
+    conn.execute(f"DELETE FROM ot_orders WHERE ot_id IN ({q})", ot_ids)
+    picker_rows = conn.execute(f"SELECT DISTINCT picker_id FROM picking_ots WHERE id IN ({q})", ot_ids).fetchall()
+    picker_ids = [int(r[0]) for r in picker_rows]
+    conn.execute(f"DELETE FROM picking_ots WHERE id IN ({q})", ot_ids)
+    for oid in order_ids:
+        ref = conn.execute("SELECT 1 FROM ot_orders WHERE order_id=? LIMIT 1", (oid,)).fetchone()
+        if not ref:
+            conn.execute("DELETE FROM order_items WHERE order_id=?", (oid,))
+            conn.execute("DELETE FROM orders WHERE id=?", (oid,))
+    for pid in picker_ids:
+        ref = conn.execute("SELECT 1 FROM picking_ots WHERE picker_id=? LIMIT 1", (pid,)).fetchone()
+        if not ref:
+            conn.execute("DELETE FROM pickers WHERE id=?", (pid,))
+
+
+def restore_picking_batch_from_sheets(batch_key: str, replace_existing: bool = True) -> tuple[bool, str]:
+    ok, raw_events, msg = get_picking_backup_events_from_sheets(batch_key)
+    if not ok:
+        return False, msg
+    events = _dedupe_picking_sheet_events(raw_events)
+    entities, snap_hash, snapshot_ts, snapshot_order = _select_latest_picking_snapshot(events)
+    if not entities:
+        return False, "No existe un snapshot completo PICKING_SQLITE_V1 para este lote."
+
+    ots = [x for x in entities if x.get("entity") == "ot"]
+    if not ots:
+        return False, "Snapshot inválido: no contiene OTs."
+    batch_label = _picking_clean(ots[0].get("batch_label")) or batch_key
+
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("BEGIN IMMEDIATE")
+        if replace_existing:
+            _delete_local_picking_batch(conn, batch_key)
+
+        picker_id_by_name = {}
+        ot_id_by_code = {}
+        for e in ots:
+            pname = _picking_clean(e.get("picker_name"))
+            if not pname:
+                continue
+            c.execute("INSERT OR IGNORE INTO pickers(name) VALUES (?)", (pname,))
+            pid_row = c.execute("SELECT id FROM pickers WHERE name=?", (pname,)).fetchone()
+            if not pid_row:
+                continue
+            pid = int(pid_row[0])
+            picker_id_by_name[pname] = pid
+            ot_code = _picking_clean(e.get("ot_code"))
+            if not ot_code:
+                continue
+            c.execute(
+                """INSERT OR REPLACE INTO picking_ots
+                   (id,ot_code,picker_id,status,created_at,closed_at,model,batch_key,batch_label)
+                   VALUES ((SELECT id FROM picking_ots WHERE ot_code=?),?,?,?,?,?,?,?,?)""",
+                (
+                    ot_code, ot_code, pid, _picking_clean(e.get("status")) or "OPEN",
+                    _picking_clean(e.get("created_at")) or now_iso(), e.get("closed_at"),
+                    _picking_clean(e.get("model")) or "SKU", batch_key,
+                    _picking_clean(e.get("batch_label")) or batch_label,
+                ),
+            )
+            row = c.execute("SELECT id FROM picking_ots WHERE ot_code=?", (ot_code,)).fetchone()
+            if row:
+                ot_id_by_code[ot_code] = int(row[0])
+
+        order_id_by_ml = {}
+        for e in [x for x in entities if x.get("entity") == "order"]:
+            mlid = _picking_clean(e.get("ml_order_id"))
+            if not mlid:
+                continue
+            c.execute("INSERT OR IGNORE INTO orders(ml_order_id,buyer,created_at) VALUES (?,?,?)", (mlid, e.get("buyer"), e.get("created_at") or now_iso()))
+            c.execute("UPDATE orders SET buyer=?,created_at=? WHERE ml_order_id=?", (e.get("buyer"), e.get("created_at") or now_iso(), mlid))
+            row = c.execute("SELECT id FROM orders WHERE ml_order_id=?", (mlid,)).fetchone()
+            if row:
+                order_id_by_ml[mlid] = int(row[0])
+        for oid in order_id_by_ml.values():
+            c.execute("DELETE FROM order_items WHERE order_id=?", (oid,))
+        for e in [x for x in entities if x.get("entity") == "order_item"]:
+            mlid = _picking_clean(e.get("ml_order_id"))
+            oid = order_id_by_ml.get(mlid)
+            if not oid:
+                continue
+            c.execute(
+                "INSERT INTO order_items(order_id,sku_ml,title_ml,title_tec,qty) VALUES (?,?,?,?,?)",
+                (oid, e.get("sku_ml"), e.get("title_ml"), e.get("title_tec"), int(e.get("qty") or 0)),
+            )
+        for e in [x for x in entities if x.get("entity") == "ot_order"]:
+            otid = ot_id_by_code.get(_picking_clean(e.get("ot_code")))
+            oid = order_id_by_ml.get(_picking_clean(e.get("ml_order_id")))
+            if otid and oid:
+                c.execute("INSERT INTO ot_orders(ot_id,order_id) VALUES (?,?)", (otid, oid))
+        for e in [x for x in entities if x.get("entity") == "task"]:
+            otid = ot_id_by_code.get(_picking_clean(e.get("ot_code")))
+            if not otid:
+                continue
+            c.execute(
+                """INSERT INTO picking_tasks
+                   (ot_id,sku_ml,title_ml,title_tec,qty_total,qty_picked,status,decided_at,confirm_mode,defer_rank,defer_at,family)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    otid, e.get("sku_ml"), e.get("title_ml"), e.get("title_tec"), int(e.get("qty_total") or 0),
+                    int(e.get("qty_picked") or 0), _picking_clean(e.get("status")) or "PENDING",
+                    e.get("decided_at"), e.get("confirm_mode"), int(e.get("defer_rank") or 0),
+                    e.get("defer_at"), e.get("family"),
+                ),
+            )
+        for e in [x for x in entities if x.get("entity") == "incidence"]:
+            otid = ot_id_by_code.get(_picking_clean(e.get("ot_code")))
+            if not otid:
+                continue
+            c.execute(
+                """INSERT INTO picking_incidences
+                   (ot_id,sku_ml,qty_total,qty_picked,qty_missing,reason,note,created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (otid, e.get("sku_ml"), int(e.get("qty_total") or 0), int(e.get("qty_picked") or 0),
+                 int(e.get("qty_missing") or 0), e.get("reason"), e.get("note"), e.get("created_at") or now_iso()),
+            )
+        for e in [x for x in entities if x.get("entity") == "corte"]:
+            otid = ot_id_by_code.get(_picking_clean(e.get("ot_code")))
+            if not otid:
+                continue
+            c.execute(
+                "INSERT INTO cortes_tasks(ot_id,sku_ml,title_ml,title_tec,qty_total,created_at) VALUES (?,?,?,?,?,?)",
+                (otid, e.get("sku_ml"), e.get("title_ml"), e.get("title_tec"), int(e.get("qty_total") or 0), e.get("created_at") or now_iso()),
+            )
+
+        # Aplicar sólo eventos posteriores al snapshot elegido.
+        for ev in events:
+            ev_ts = _picking_event_ts(ev)
+            try:
+                ev_order = int(ev.get("queue_id") or 0)
+            except Exception:
+                ev_order = 0
+            if snapshot_ts and ev_ts:
+                if ev_ts < snapshot_ts:
+                    continue
+                if ev_ts == snapshot_ts and snapshot_order and ev_order and ev_order <= snapshot_order:
+                    continue
+            et = _picking_clean(ev.get("event_type")).lower()
+            if et == "picking_task_state":
+                ot_code = _picking_clean(ev.get("ot_code"))
+                sku = _picking_clean(ev.get("sku_ml"))
+                otid = ot_id_by_code.get(ot_code)
+                if otid and sku:
+                    c.execute(
+                        """UPDATE picking_tasks SET qty_picked=?,status=?,decided_at=?,confirm_mode=?,defer_rank=?,defer_at=?,family=?
+                           WHERE ot_id=? AND sku_ml=?""",
+                        (int(ev.get("qty_picked") or 0), _picking_clean(ev.get("status")) or "PENDING",
+                         ev.get("decided_at"), ev.get("confirm_mode"), int(ev.get("defer_rank") or 0), ev.get("defer_at"),
+                         ev.get("family"), otid, sku),
+                    )
+            elif et == "picking_incidence_state":
+                ot_code = _picking_clean(ev.get("ot_code"))
+                otid = ot_id_by_code.get(ot_code)
+                if otid:
+                    exists = c.execute(
+                        """SELECT 1 FROM picking_incidences WHERE ot_id=? AND sku_ml=? AND reason=? AND created_at=? LIMIT 1""",
+                        (otid, ev.get("sku_ml"), ev.get("reason"), ev.get("incidence_created_at")),
+                    ).fetchone()
+                    if not exists:
+                        c.execute(
+                            """INSERT INTO picking_incidences(ot_id,sku_ml,qty_total,qty_picked,qty_missing,reason,note,created_at)
+                               VALUES (?,?,?,?,?,?,?,?)""",
+                            (otid, ev.get("sku_ml"), int(ev.get("qty_total") or 0), int(ev.get("qty_picked") or 0),
+                             int(ev.get("qty_missing") or 0), ev.get("reason"), ev.get("note"), ev.get("incidence_created_at") or _picking_event_ts(ev) or now_iso()),
+                        )
+            elif et == "picking_ot_state":
+                ot_code = _picking_clean(ev.get("ot_code"))
+                otid = ot_id_by_code.get(ot_code)
+                if otid:
+                    c.execute("UPDATE picking_ots SET status=?,closed_at=? WHERE id=?", (_picking_clean(ev.get("status")) or "OPEN", ev.get("closed_at"), otid))
+            elif et == "lote_cerrado":
+                c.execute("UPDATE picking_ots SET status='PICKED',closed_at=COALESCE(closed_at,?) WHERE batch_key=?", (_picking_event_ts(ev) or now_iso(), batch_key))
+
+        conn.commit()
+        conn.close()
+        _picking_meta_set("intentional_reset", "")
+        _picking_meta_set("last_recovery_at", now_iso())
+        return True, f"{batch_label}: restaurado desde Sheets con snapshot {snap_hash[:12]}."
+    except Exception as exc:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return False, f"No se pudo restaurar {batch_key}: {type(exc).__name__}: {exc}"
+
+
+def _picking_local_is_empty() -> bool:
+    try:
+        with db_conn(commit=False) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM picking_ots").fetchone()
+        return int((row[0] if row else 0) or 0) == 0
+    except Exception:
+        return True
+
+
+def _claim_picking_recovery_lease(owner: str, lease_seconds: int = 300) -> bool:
+    now_epoch = time.time()
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("BEGIN IMMEDIATE")
+        row_owner = c.execute("SELECT value FROM picking_sync_meta WHERE key='recovery_owner'").fetchone()
+        row_until = c.execute("SELECT value FROM picking_sync_meta WHERE key='recovery_until'").fetchone()
+        cur_owner = _picking_clean(row_owner[0]) if row_owner else ""
+        try:
+            cur_until = float(row_until[0]) if row_until and row_until[0] not in (None, "") else 0.0
+        except Exception:
+            cur_until = 0.0
+        if cur_owner and cur_owner != owner and cur_until > now_epoch:
+            conn.rollback(); conn.close(); return False
+        until = str(now_epoch + max(60, int(lease_seconds)))
+        c.execute("""INSERT INTO picking_sync_meta(key,value,updated_at) VALUES ('recovery_owner',?,?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""", (owner, now_iso()))
+        c.execute("""INSERT INTO picking_sync_meta(key,value,updated_at) VALUES ('recovery_until',?,?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""", (until, now_iso()))
+        conn.commit(); conn.close(); return True
+    except Exception:
+        try:
+            conn.rollback(); conn.close()
+        except Exception:
+            pass
+        return False
+
+
+def _release_picking_recovery_lease(owner: str):
+    try:
+        with db_conn(commit=True) as conn:
+            row = conn.execute("SELECT value FROM picking_sync_meta WHERE key='recovery_owner'").fetchone()
+            if row and _picking_clean(row[0]) == owner:
+                conn.execute("UPDATE picking_sync_meta SET value='',updated_at=? WHERE key='recovery_owner'", (now_iso(),))
+                conn.execute("UPDATE picking_sync_meta SET value='0',updated_at=? WHERE key='recovery_until'", (now_iso(),))
+    except Exception:
+        pass
+
+
+def _picking_recovery_is_active() -> bool:
+    owner = _picking_meta_get("recovery_owner")
+    if not owner:
+        return False
+    try:
+        until = float(_picking_meta_get("recovery_until", "0") or 0)
+    except Exception:
+        until = 0.0
+    return until > time.time()
+
+
+def auto_restore_picking_if_database_was_lost() -> tuple[bool, str]:
+    """Auto-rescate sólo para DB vacío no marcado como reinicio intencional."""
+    if not _picking_local_is_empty():
+        return False, "local_not_empty"
+    if _picking_meta_get("intentional_reset"):
+        return False, "intentional_reset"
+    owner = uuid.uuid4().hex
+    if not _claim_picking_recovery_lease(owner, lease_seconds=300):
+        return False, "recovery_in_progress"
+    try:
+        ok, lotes, msg = get_picking_backup_lotes_from_sheets()
+        if not ok:
+            return False, msg
+        active = [r for r in lotes if _picking_clean(r.get("status") or "ACTIVO").upper() not in {"CERRADO", "CLOSED", "ELIMINADO", "DELETED"}]
+        if not active:
+            return False, "no_active_lotes"
+        restored = 0
+        errors = []
+        for lote in sorted(active, key=lambda r: _picking_clean(r.get("created_at") or r.get("lote_created_at"))):
+            key = _picking_clean(lote.get("backup_lote_key")) or _picking_clean(lote.get("lote_id"))
+            rok, rmsg = restore_picking_batch_from_sheets(key, replace_existing=True)
+            if rok:
+                restored += 1
+            else:
+                errors.append(rmsg)
+        if restored:
+            return True, f"Recuperados {restored} lote(s) activos desde Sheets." + ((" " + " | ".join(errors[:2])) if errors else "")
+        return False, " | ".join(errors) if errors else "No se pudo restaurar ningún lote."
+    finally:
+        _release_picking_recovery_lease(owner)
+
+
+def render_picking_backup_sidebar():
+    status = get_picking_backup_status()
+    pending = int(status.get("pending") or 0)
+    failed = int(status.get("failed") or 0)
+    with st.sidebar.expander("☁️ Respaldo Picking", expanded=False):
+        if failed:
+            st.error(f"{failed} evento(s) con error")
+        elif pending:
+            st.warning(f"{pending} evento(s) pendientes")
+        else:
+            st.success("Sincronizado")
+        if status.get("last_sent"):
+            st.caption(f"Último envío: {to_chile_display(status.get('last_sent'))}")
+        if st.button("Sincronizar ahora", key="picking_sync_now_sidebar", use_container_width=True):
+            flush_picking_backup_queue(limit=120, include_failed=True)
+            st.rerun()
+
+
+def render_picking_recovery_admin_ui():
+    with st.expander("☁️ Respaldo automático / Rescate desde Sheets", expanded=False):
+        status = get_picking_backup_status()
+        a, b, c = st.columns(3)
+        a.metric("Pendientes", int(status.get("pending") or 0))
+        b.metric("Enviados", int(status.get("sent") or 0))
+        c.metric("Con error", int(status.get("failed") or 0))
+        col1, col2 = st.columns(2)
+        if col1.button("Sincronizar cola", key="adm_sync_picking_backup"):
+            flush_picking_backup_queue(limit=250, include_failed=True)
+            st.rerun()
+        refresh = col2.button("Buscar lotes en Sheets", key="adm_refresh_picking_lotes")
+        if refresh:
+            ok, rows, msg = get_picking_backup_lotes_from_sheets()
+            st.session_state["_picking_sheet_lotes_admin"] = rows if ok else []
+            st.session_state["_picking_sheet_lotes_admin_msg"] = msg
+        rows = st.session_state.get("_picking_sheet_lotes_admin", None)
+        msg = st.session_state.get("_picking_sheet_lotes_admin_msg", "")
+        if msg:
+            st.caption(msg)
+        if rows is None:
+            st.info("Pulsa **Buscar lotes en Sheets** sólo cuando necesites un rescate manual.")
+            return
+        if not rows:
+            st.info("No hay lotes Picking recuperables en Sheets.")
+            return
+        options = []
+        by_label = {}
+        for r in rows:
+            key = _picking_clean(r.get("backup_lote_key")) or _picking_clean(r.get("lote_id"))
+            label = f"{_picking_clean(r.get('lote_nombre')) or key} · {_picking_clean(r.get('status')) or 'ACTIVO'} · {key}"
+            options.append(label)
+            by_label[label] = key
+        selected = st.selectbox("Lote a recuperar", options, key="adm_picking_restore_select")
+        if st.button("Restaurar lote seleccionado", type="primary", key="adm_picking_restore_btn"):
+            rok, rmsg = restore_picking_batch_from_sheets(by_label[selected], replace_existing=True)
+            if rok:
+                st.success(rmsg)
+                st.session_state.pop("selected_picker", None)
+                st.rerun()
+            else:
+                st.error(rmsg)
+
 
 # =========================
 # BACKUP/RESTORE POR MÓDULO (SQLite parcial)
@@ -912,6 +2066,33 @@ def init_db():
     _ensure_col("sku_publications", "image_url", "TEXT")
     _ensure_col("sku_publications", "updated_at", "TEXT")
 
+    # --- Respaldo persistente PICKING (aislado del resto de módulos) ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS picking_backup_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        last_attempt_at TEXT,
+        sent_at TEXT
+    );
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS picking_sync_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT
+    );
+    """)
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_picking_backup_queue_status_id ON picking_backup_queue(status,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_picking_ots_batch_key ON picking_ots(batch_key)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_picking_tasks_ot_status ON picking_tasks(ot_id,status)")
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -2309,6 +3490,7 @@ def save_orders_and_build_ots(
     num_pickers: int,
     model: str = "VENTAS",
     familia_map_sku: dict | None = None,
+    source_label: str | None = None,
 ):
     """
     Genera la tanda de picking.
@@ -2324,6 +3506,9 @@ def save_orders_and_build_ots(
         model = "VENTAS"
 
     familia_map_sku = familia_map_sku or {}
+    picker_names = [f"P{i+1}" for i in range(max(1, int(num_pickers or 1)))]
+    batch_key = f"PK-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))}"
+    batch_label = _build_picking_batch_label(source_label, model, picker_names)
 
     conn = get_conn()
     c = conn.cursor()
@@ -2371,8 +3556,7 @@ def save_orders_and_build_ots(
 
     # pickers
     picker_ids = []
-    for i in range(int(num_pickers)):
-        name = f"P{i+1}"
+    for name in picker_names:
         c.execute("INSERT INTO pickers (name) VALUES (?)", (name,))
         picker_ids.append(c.lastrowid)
 
@@ -2380,8 +3564,8 @@ def save_orders_and_build_ots(
     ot_ids = []
     for pid in picker_ids:
         c.execute(
-            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at, model) VALUES (?,?,?,?,?,?)",
-            ("", pid, "OPEN", now_iso(), None, model)
+            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at, model, batch_key, batch_label) VALUES (?,?,?,?,?,?,?,?)",
+            ("", pid, "OPEN", now_iso(), None, model, batch_key, batch_label)
         )
         ot_id = c.lastrowid
         ot_code = f"OT{ot_id:06d}"
@@ -2429,12 +3613,13 @@ def save_orders_and_build_ots(
 
         conn.commit()
         conn.close()
-        return
+        _picking_meta_set("intentional_reset", "")
+        queue_picking_batch_snapshot(batch_key, motivo="LOTE_CREADO", include_lote_created=True)
+        return {"created": True, "reason": "ok", "new_orders": int(sales_df["ml_order_id"].nunique()), "picker_names": picker_names, "batch_key": batch_key, "batch_label": batch_label}
 
     # === Modelo por SKU + Familia: prioridad familia + balance dinámico ===
     # El planificador trabaja con N pickers, conserva cada SKU completo y sólo divide
     # una familia cuando mantenerla íntegra rompe el balance objetivo.
-    picker_names = [f"P{i+1}" for i in range(len(ot_ids))]
     plan = _plan_sku_family_distribution(
         sales_df,
         len(ot_ids),
@@ -2480,6 +3665,9 @@ def save_orders_and_build_ots(
 
     conn.commit()
     conn.close()
+    _picking_meta_set("intentional_reset", "")
+    queue_picking_batch_snapshot(batch_key, motivo="LOTE_CREADO", include_lote_created=True)
+    return {"created": True, "reason": "ok", "new_orders": int(sales_df["ml_order_id"].nunique()), "picker_names": picker_names, "batch_key": batch_key, "batch_label": batch_label}
 
 
 def append_orders_and_build_ots(
@@ -2615,7 +3803,9 @@ def append_orders_and_build_ots(
 
         conn.commit()
         conn.close()
-        return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_label": batch_label}
+        _picking_meta_set("intentional_reset", "")
+        queue_picking_batch_snapshot(batch_key, motivo="LOTE_CREADO", include_lote_created=True)
+        return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_key": batch_key, "batch_label": batch_label}
 
     # Modelo SKU/Familia con el mismo planificador usado por la vista previa.
     plan = _plan_sku_family_distribution(
@@ -2660,7 +3850,9 @@ def append_orders_and_build_ots(
 
     conn.commit()
     conn.close()
-    return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_label": batch_label}
+    _picking_meta_set("intentional_reset", "")
+    queue_picking_batch_snapshot(batch_key, motivo="LOTE_CREADO", include_lote_created=True)
+    return {"created": True, "reason": "ok", "new_orders": len(new_order_ids), "picker_names": picker_names, "batch_key": batch_key, "batch_label": batch_label}
 
 
 
@@ -2827,7 +4019,10 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
                 }
                 st.rerun()
         else:
-            save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
+            save_orders_and_build_ots(
+                sales_df, inv_map_sku, int(num_pickers), model=model,
+                familia_map_sku=familia_map_sku, source_label=source_label
+            )
             st.session_state["picking_import_flash"] = {
                 "level": "success",
                 "message": "OTs creadas. Anda a Picking y selecciona P1, P2, ...",
@@ -3093,6 +4288,9 @@ def page_picking():
         if st.button("Cerrar OT"):
             c.execute("UPDATE picking_ots SET status='PICKED', closed_at=? WHERE id=?", (now_iso(), ot_id))
             conn.commit()
+            ot_payload = _picking_ot_payload(ot_id)
+            queue_picking_ot_state(ot_id)
+            queue_picking_batch_closed_if_complete(_picking_clean(ot_payload.get("batch_key")))
             st.success("OT cerrada.")
         conn.close()
         return
@@ -3253,6 +4451,7 @@ def page_picking():
                     (new_rank, now_iso(), task_id)
                 )
                 conn.commit()
+                queue_picking_task_state(task_id)
             except Exception:
                 pass
             # Limpiar estado UI de este task y seguir con el siguiente
@@ -3296,12 +4495,14 @@ def page_picking():
 
             elif q == int(qty_total):
                 # Si el picker usó "Sin EAN", lo registramos en incidencias para trazabilidad
+                manual_incidence_id = None
                 if str(s.get("confirm_mode") or "") == "MANUAL_NO_EAN":
                     try:
                         c.execute("""INSERT INTO picking_incidences
                                      (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, note, created_at)
                                      VALUES (?,?,?,?,?,?,?,?)""",
                                   (ot_id, sku_expected, int(qty_total), int(q), 0, "SIN_EAN", "", now_iso()))
+                        manual_incidence_id = int(c.lastrowid)
                     except Exception:
                         pass
 
@@ -3311,6 +4512,16 @@ def page_picking():
                     WHERE id=?
                 """, (q, now_iso(), s["confirm_mode"], task_id))
                 conn.commit()
+                # Respaldo no bloqueante: SQLite ya confirmó la operación.
+                backup_events = []
+                task_payload = _picking_task_payload(task_id)
+                if task_payload:
+                    backup_events.append(("picking_task_state", task_payload))
+                if manual_incidence_id:
+                    inc_payload = _picking_incidence_payload(manual_incidence_id)
+                    if inc_payload:
+                        backup_events.append(("picking_incidence_state", inc_payload))
+                enqueue_picking_backup_events_batch(backup_events)
                 state.pop(str(task_id), None)
                 st.success("OK. Siguiente…")
                 sfx_emit("OK")
@@ -3350,6 +4561,7 @@ def page_picking():
                                  (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, note, created_at)
                                  VALUES (?,?,?,?,?,?,?,?)""",
                               (ot_id, sku_expected, int(qty_total), q, missing, "FALTANTE", note_val or "", now_iso()))
+                    incidence_id = int(c.lastrowid)
 
                     c.execute("""UPDATE picking_tasks
                                  SET qty_picked=?, status='INCIDENCE', decided_at=?, confirm_mode=?
@@ -3357,6 +4569,14 @@ def page_picking():
                               (q, now_iso(), s["confirm_mode"], task_id))
 
                     conn.commit()
+                    backup_events = []
+                    task_payload = _picking_task_payload(task_id)
+                    inc_payload = _picking_incidence_payload(incidence_id)
+                    if task_payload:
+                        backup_events.append(("picking_task_state", task_payload))
+                    if inc_payload:
+                        backup_events.append(("picking_incidence_state", inc_payload))
+                    enqueue_picking_backup_events_batch(backup_events)
                     st.session_state["pick_inc_pending"] = None
                     state.pop(str(task_id), None)
                     st.success("Enviado a incidencias. Siguiente…")
@@ -3422,6 +4642,12 @@ def page_picking():
                                 (base_rank + i, now_iso(), tid_rot)
                             )
                         conn.commit()
+                        reorder_events = []
+                        for tid_rot in rotated:
+                            payload = _picking_task_payload(tid_rot)
+                            if payload:
+                                reorder_events.append(("picking_task_state", payload))
+                        enqueue_picking_backup_events_batch(reorder_events)
 
                 except Exception:
                     pass
@@ -3450,6 +4676,7 @@ def page_admin():
     # =========================
     st.subheader("Persistencia / Respaldo — PICKING")
     _render_module_backup_ui("picking", "Picking", PICKING_TABLES)
+    render_picking_recovery_admin_ui()
 
     st.divider()
 
@@ -3676,6 +4903,16 @@ def page_admin():
                                 cursor = 0
                                 moved_total = 0
                                 try:
+                                    # La OT LIB conserva el lote original. No se recalcula ni mezcla el reparto.
+                                    src_meta = c.execute(
+                                        """SELECT COALESCE(po.batch_key,''),COALESCE(po.batch_label,''),COALESCE(po.model,'SKU')
+                                             FROM picking_tasks pt JOIN picking_ots po ON po.id=pt.ot_id
+                                            WHERE pt.id=?""",
+                                        (selected_ids_sorted[0],),
+                                    ).fetchone()
+                                    src_batch_key = str(src_meta[0] or "") if src_meta else ""
+                                    src_batch_label = str(src_meta[1] or "") if src_meta else ""
+                                    src_model = str(src_meta[2] or "SKU") if src_meta else "SKU"
                                     for dname, cnt in dest_counts.items():
                                         cnt = int(cnt)
                                         if cnt <= 0:
@@ -3689,8 +4926,10 @@ def page_admin():
                                         new_code = _new_ot_code("LIB")
                                         now_iso_ts = now_iso()
                                         c.execute(
-                                            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at) VALUES (?,?,?,?,NULL)",
-                                            (new_code, dest_id, "OPEN", now_iso_ts)
+                                            """INSERT INTO picking_ots
+                                               (ot_code, picker_id, status, created_at, closed_at, model, batch_key, batch_label)
+                                               VALUES (?,?,?,?,NULL,?,?,?)""",
+                                            (new_code, dest_id, "OPEN", now_iso_ts, src_model, src_batch_key, src_batch_label)
                                         )
                                         new_ot_id = int(c.lastrowid)
 
@@ -3699,6 +4938,8 @@ def page_admin():
                                         moved_total += len(chunk)
 
                                     conn.commit()
+                                    if src_batch_key:
+                                        queue_picking_batch_snapshot(src_batch_key, motivo="REASIGNACION_ADMIN", include_lote_created=False)
                                     sfx_emit("OK")
                                     st.success(f"Listo: movidas {moved_total} tareas desde {src_name}. Se crearon OTs 'LIB-*' para los destinos.")
                                     st.rerun()
@@ -3753,6 +4994,25 @@ def page_admin():
         colA, colB = st.columns(2)
         with colA:
             if st.button("✅ Sí, borrar todo y reiniciar"):
+                # Marcar lotes como eliminados en Sheets para que un reinicio intencional
+                # no sea interpretado como pérdida de SQLite y no resurja automáticamente.
+                try:
+                    batch_rows = c.execute(
+                        """SELECT DISTINCT COALESCE(batch_key,''),COALESCE(batch_label,''),MIN(created_at)
+                             FROM picking_ots WHERE COALESCE(batch_key,'')<>''
+                            GROUP BY batch_key,batch_label"""
+                    ).fetchall()
+                    delete_events = []
+                    for bk, bl, bcreated in batch_rows:
+                        delete_events.append(("lote_eliminado", {
+                            "lote_id": str(bk), "lote_nombre": str(bl or bk), "backup_lote_key": str(bk),
+                            "lote_created_at": bcreated or "", "hoja": "PICKING", "status": "ELIMINADO",
+                            "usuario": "ADMIN", "created_at": now_iso(),
+                        }))
+                    enqueue_picking_backup_events_batch(delete_events)
+                except Exception:
+                    pass
+                _picking_meta_set("intentional_reset", now_iso())
                 c.execute("DELETE FROM picking_tasks;")
                 c.execute("DELETE FROM picking_incidences;")
                 c.execute("DELETE FROM ot_orders;")
@@ -6671,6 +7931,28 @@ def main():
     # MODO PICKING FLEX / COLECTA
     # ==========
     if mode == "FLEX_PICK":
+        # Mantener la cola drenando sin bloquear PDA. Si Streamlit recreó SQLite vacío,
+        # intentar recuperar automáticamente sólo los lotes Picking que sigan activos.
+        trigger_picking_backup_sync_async(limit=PICKING_BACKUP_WORKER_LIMIT)
+        render_picking_backup_sidebar()
+        if _picking_local_is_empty() and not st.session_state.get("_picking_auto_recovery_checked", False):
+            st.session_state["_picking_auto_recovery_checked"] = True
+            recovered, recovery_msg = auto_restore_picking_if_database_was_lost()
+            if recovered:
+                st.session_state["picking_recovery_flash"] = recovery_msg
+                st.session_state.pop("selected_picker", None)
+                st.rerun()
+            elif recovery_msg not in {"local_not_empty", "intentional_reset", "no_active_lotes", "recovery_in_progress"}:
+                st.sidebar.warning(f"Rescate Sheets: {recovery_msg}")
+
+        if _picking_recovery_is_active():
+            st.warning("☁️ Recuperando Picking desde Sheets. Otro dispositivo inició el rescate; esta pantalla se habilitará al terminar.")
+            st.stop()
+
+        recovery_flash = st.session_state.pop("picking_recovery_flash", None)
+        if recovery_flash:
+            st.success(f"☁️ {recovery_flash}")
+
         pages = [
             "1) Picking",
             "2) Importar ventas",
