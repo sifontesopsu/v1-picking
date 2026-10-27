@@ -1,0 +1,54 @@
+WMS Ferretería Aurora - Ajuste de carga PDF de Picking (27-10-2026)
+
+OBJETIVO
+Importar Control/Manifiesto PDF de Mercado Libre al mismo flujo de tandas
+que ya utiliza el Excel, conservando creación de OTs, pickeadores y ambos
+modelos de distribución, sin modificar Sorting, Kame ni respaldos.
+
+ARCHIVOS CAMBIADOS
+- app.py: lector PDF y sección "Importar ventas" del modo Picking.
+- tests/test_import_pdf.py: pruebas unitarias aisladas con PDF generados.
+- Este archivo: instrucciones de prueba.
+
+CAMBIOS
+1. Admite uno o varios PDF en la carga de Picking.
+2. Reconoce 'Venta', 'SKU' y 'Cantidad' en diferentes renglones y órdenes;
+   maneja varios artículos por venta y varias ventas en una página.
+3. Suma ítems repetidos del mismo SKU dentro de una venta.
+4. Rechaza PDF inválidos, páginas sin texto, ventas sin ítems,
+   SKU/cantidades incompletos y ventas duplicadas entre varios PDF.
+   No se crean tandas u OTs si la validación falla.
+5. Muestra cantidad de ventas, líneas SKU y unidades extraídas;
+   avisa de SKU no encontrados en el maestro.
+6. Usa caché en memoria de Streamlit para no releer el mismo PDF
+   cada vez que cambia un control del panel.
+
+NO SE CAMBIÓ
+- Carga Excel.
+- Algoritmo de reparto por ventas o por SKU/familia.
+- Base de datos, tablas y migraciones.
+- Sorting (módulo obsoleto).
+- Robot Kame y stock.
+- Respaldo Google Sheets.
+- Dependencias (pdfplumber ya estaba en requirements.txt).
+
+LÍMITES Y PRUEBA REAL
+Compatible con PDF que contiene texto seleccionable y marca explícitamente
+número de Venta, SKU y Cantidad. No sirve para PDF escaneado ni para un
+manifiesto puramente logístico con solo ID de envío y sin SKU/cantidades.
+
+Los ensayos se ejecutaron con PDF sintéticos porque no se adjuntó
+una muestra real exportada desde Mercado Libre. Se recomienda probar
+la nueva carga en una instancia aislada antes de subir cambios a producción.
+
+INSTRUCCIONES
+1. Resguardar la versión actual del repositorio y la base de datos.
+2. Desplegar el app.py actualizado, con el resto de archivos sin cambios.
+3. Abrir Picking > Importar ventas > Control/Manifiesto PDF.
+4. Seleccionar uno o varios archivos de Control PDF exportados por ML.
+5. Verificar en vista previa ventas, SKU y cantidades; comprobar con el
+   manifiesto original antes de pulsar "Cargar y generar OTs".
+6. Probar primero con una tanda de ejemplo, sin alterar los lotes activos.
+
+Pruebas aisladas (requiere instalar las dependencias del proyecto):
+python -m unittest discover -s tests -v

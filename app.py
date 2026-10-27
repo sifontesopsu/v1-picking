@@ -2601,128 +2601,243 @@ def load_cortes_set(path: str = CORTES_FILE) -> set:
 # =========================
 
 def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
-    """
-    Parser robusto para Manifiesto PDF (etiquetas).
+    """Convierte un Control/Manifiesto de ML en las mismas filas que el Excel de Picking.
 
-    Cubre casos reales de ML donde el PDF puede traer, en cualquier orden:
-      - "Venta: <id> SKU:<sku>" en el mismo renglón
-      - "Pack ID: ... SKU:<sku>" en un renglón y luego "Venta: <id> Cantidad: <n>" en el siguiente
-      - "SKU:<sku>" en un renglón y "Cantidad:<n>" en el siguiente
-      - Varias ocurrencias de SKU/Cantidad dentro de un mismo renglón
+    Soporta Venta, SKU y Cantidad en líneas distintas o en diferente orden,
+    múltiples ítems y ventas por página. No usa las funciones ni tablas de Sorting.
 
-    Regla: cada vez que se detecta una Cantidad, si existe un SKU "vigente" y una Venta vigente,
-    se crea un registro (línea) para esa venta+sku.
+    SEGURIDAD OPERATIVA: un PDF escaneado, sin detalle de productos o con
+    cantidades/SKU sin identificar se rechaza COMPLETO; nunca genera OTs parciales.
     """
+    import io
+
     if not HAS_PDF_LIB:
-        raise RuntimeError("Falta pdfplumber. Agrega 'pdfplumber' a requirements.txt")
+        raise ValueError("La lectura PDF requiere 'pdfplumber' (requirements.txt).")
 
-    records: list[dict] = []
+    if isinstance(uploaded_file, (bytes, bytearray)):
+        content = bytes(uploaded_file)
+    elif hasattr(uploaded_file, "getvalue"):
+        content = uploaded_file.getvalue()
+    else:
+        content = uploaded_file.read()
 
-    re_venta = re.compile(r"\bVenta\s*[:#]?\s*([0-9]+)\b", re.IGNORECASE)
-    re_sku = re.compile(r"\bSKU\s*[:#]?\s*([0-9A-Za-z.\-]+)\b", re.IGNORECASE)
-    re_qty = re.compile(r"\bCantidad\s*[:#]?\s*([0-9]+)\b", re.IGNORECASE)
+    if not content or not content.lstrip().startswith(b"%PDF-"):
+        raise ValueError("El archivo no es un PDF válido.")
 
-    def _is_noise_line(s: str) -> bool:
-        low = (s or "").strip().lower()
-        if not low:
-            return True
-        bad = [
-            "código carrier", "codigo carrier", "firma carrier",
-            "fecha y hora", "despacha tus productos", "identifi",
-        ]
-        if any(b in low for b in bad):
-            return True
-        if re.fullmatch(r"[0-9 .:/\-]+", low):
-            return True
-        return False
+    # Se leen exclusivamente marcadores explícitos. Los números de envío,
+    # códigos de barras y IDs de pack NO son automáticamente números de venta.
+    sale_re = re.compile(
+        r"\b(?:Venta|N[°ºo.]?\s*de\s*venta|N[uú]mero\s+de\s+venta|"
+        r"ID\s+de\s+venta|Pedido|N[uú]mero\s+de\s+pedido)\s*[:#=-]?\s*#?\s*(\d{8,20})\b",
+        re.IGNORECASE,
+    )
+    sku_re = re.compile(
+        r"\b(?:SKU(?:\s+(?:del\s+)?vendedor|\s+ML)?|C[oó]digo\s+SKU)\s*[:#=]\s*"
+        r"([A-Za-z0-9][A-Za-z0-9._/-]{0,49})",
+        re.IGNORECASE,
+    )
+    qty_re = re.compile(
+        r"\b(?:Cantidad|Cant\.?|Unidades?|Unid\.?)\s*[:#=]?\s*(\d{1,6})\b",
+        re.IGNORECASE,
+    )
+    buyer_re = re.compile(r"\b(?:Comprador|Cliente|Destinatario)\s*:\s*(.+)$", re.IGNORECASE)
+    pack_re = re.compile(r"\bPack\s*ID\s*[:#=]\s*(\d{8,20})\b", re.IGNORECASE)
 
-    def _maybe_buyer(line: str) -> str:
-        # Quitamos cosas típicas que se pegan al nombre (ej: "Diámetro de la cupla: ...")
-        # sin ser demasiado agresivos.
-        cut_tokens = ["diámetro", "diametro", "color:", "acabado:", "pack id", "sku", "cantidad", "venta:"]
-        low = line.lower()
-        for tok in cut_tokens:
-            idx = low.find(tok)
-            if idx > 0:
-                return line[:idx].strip()
-        return line.strip()
+    columns = ["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"]
+    records = []
+    seen_orders = set()
+    buyer_by_order = {}
+    issues = []
+    empty_pages = []
 
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            text = (page.extract_text() or "").replace("\r", "\n")
-            lines = [ln.strip() for ln in text.splitlines() if ln and str(ln).strip()]
+    try:
+        pdf_obj = pdfplumber.open(io.BytesIO(content))
+    except Exception as exc:
+        raise ValueError("No se pudo abrir el PDF. Verifica que no esté dañado o protegido.") from exc
 
-            current_order: str | None = None
-            current_buyer: str = ""
+    with pdf_obj as pdf:
+        if not pdf.pages:
+            raise ValueError("El PDF no contiene páginas.")
 
-            # SKU "vigente" para el próximo "Cantidad"
-            sku_current: str | None = None
+        for page_no, page in enumerate(pdf.pages, start=1):
+            try:
+                page_text = (page.extract_text() or "").replace("\xa0", " ").replace("\r", "\n")
+            except Exception as exc:
+                raise ValueError(f"No se pudo leer la página {page_no} del PDF.") from exc
 
-            # SKU visto antes de que aparezca la Venta (caso: "Pack ID ... SKU:xxxx" y luego "Venta ... Cantidad ...")
-            pending_sku_before_order: str | None = None
+            if not page_text.strip():
+                empty_pages.append(page_no)
+                continue
 
+            # Se restablece contexto por página para no trasladar por error
+            # SKU de una etiqueta/venta a otra página distinta.
+            current_order = None
+            current_buyer = ""
+            current_pack = None
+            waiting_skus = []
+            waiting_qty = []
+            items_before_sale = []
+            lines = [line.strip() for line in page_text.splitlines() if line.strip()]
             for line in lines:
-                if _is_noise_line(line):
-                    continue
+                # Extraer todas las entidades con su posición real: ML puede
+                # ubicar 'SKU: ...' ANTES de 'Venta: ... Cantidad: ...'.
+                events = []
+                for pattern, kind in ((sale_re, "SALE"), (sku_re, "SKU"), (qty_re, "QTY"),
+                                      (pack_re, "PACK")):
+                    for match in pattern.finditer(line):
+                        events.append((match.start(), kind, match.group(1)))
+                events.sort(key=lambda e: e[0])
 
-                # Capturar Venta (no reseteamos SKU aquí; hay PDFs donde el SKU viene en la línea anterior)
-                mv = re_venta.search(line)
-                if mv:
-                    current_order = mv.group(1).strip()
-                    current_buyer = ""
-                    # Si hay un SKU pendiente (visto antes de la venta), lo activamos
-                    if pending_sku_before_order and not sku_current:
-                        sku_current = pending_sku_before_order
-                        pending_sku_before_order = None
+                customer_match = buyer_re.search(line)
+                if customer_match and current_order:
+                    current_buyer = customer_match.group(1).strip()[:120]
+                    buyer_by_order[current_order] = current_buyer
 
-                # Buyer: primera línea razonable después de "Venta:" que no sea metadata
-                if current_order and not current_buyer:
-                    low = line.lower()
-                    if (not _is_noise_line(line)
-                        and "venta" not in low
-                        and "sku" not in low
-                        and "cantidad" not in low
-                        and ":" not in line  # evita "Color:" etc
-                        and len(line) <= 120):
-                        cand = _maybe_buyer(line)
-                        if cand and len(cand) >= 3:
-                            current_buyer = cand
+                for _pos, kind, value in events:
+                    if kind == "PACK":
+                        # El PACK es contextual. No sustituyen al número Venta.
+                        if current_pack and value != current_pack:
+                            # Nuevo paquete antes de su 'Venta:'; el próximo SKU
+                            # no debe heredar la venta del paquete anterior.
+                            current_order = None
+                            current_buyer = ""
+                        current_pack = value
 
-                # Tokenizar SKU y Cantidad en orden de aparición en el renglón
-                tokens = []
-                for ms in re_sku.finditer(line):
-                    tokens.append((ms.start(), "SKU", normalize_sku(ms.group(1))))
-                for mq in re_qty.finditer(line):
-                    try:
-                        qv = int(mq.group(1))
-                    except Exception:
-                        qv = 0
-                    tokens.append((mq.start(), "QTY", qv))
-                tokens.sort(key=lambda x: x[0])
+                    elif kind == "SALE":
+                        if current_order != value:
+                            current_order = value
+                            current_buyer = buyer_by_order.get(value, "")
+                        seen_orders.add(value)
+                        # SKU+Cantidad que preceden al primer 'Venta:'.
+                        if items_before_sale:
+                            for sku, qty in items_before_sale:
+                                records.append({"ml_order_id": current_order, "buyer": current_buyer,
+                                                "sku_ml": sku, "title_ml": "", "qty": qty})
+                            items_before_sale.clear()
 
-                for _, kind, val in tokens:
-                    if kind == "SKU":
-                        if current_order:
-                            sku_current = val
+                    elif kind == "SKU":
+                        sku = normalize_sku(value)
+                        if not sku:
+                            issues.append(f"página {page_no}: SKU vacío")
+                            continue
+                        if waiting_qty:
+                            qty = waiting_qty.pop(0)
+                            item = (sku, qty)
+                            if current_order:
+                                records.append({"ml_order_id": current_order, "buyer": current_buyer,
+                                                "sku_ml": sku, "title_ml": "", "qty": qty})
+                            else:
+                                items_before_sale.append(item)
                         else:
-                            pending_sku_before_order = val
+                            waiting_skus.append(sku)
+
                     elif kind == "QTY":
-                        qty = int(val) if val is not None else 0
-                        if current_order and sku_current and qty > 0:
-                            records.append(
-                                {
-                                    "ml_order_id": str(current_order).strip(),
-                                    "buyer": str(current_buyer or "").strip(),
-                                    "sku_ml": str(sku_current).strip(),
-                                    "title_ml": "",
-                                    "qty": qty,
-                                }
-                            )
-                            # Importante: NO limpiamos sku_current aquí, porque puede venir otra Cantidad asociada
-                            # al mismo SKU en el mismo bloque (raro, pero seguro).
+                        qty = int(value)
+                        if qty <= 0:
+                            issues.append(f"página {page_no}: cantidad no positiva")
+                            continue
+                        if waiting_skus:
+                            sku = waiting_skus.pop(0)
+                            if current_order:
+                                records.append({"ml_order_id": current_order, "buyer": current_buyer,
+                                                "sku_ml": sku, "title_ml": "", "qty": qty})
+                            else:
+                                items_before_sale.append((sku, qty))
+                        else:
+                            waiting_qty.append(qty)
 
-    return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
+                # En algunos PDF el comprador aparece después del marcador Venta
+                # en el MISMO renglón: se lee tras los eventos.
+                if customer_match and current_order:
+                    current_buyer = customer_match.group(1).strip()[:120]
+                    buyer_by_order[current_order] = current_buyer
 
+            # El Control de Mercado Libre presenta el comprador sin etiqueta
+            # (texto ubicado debajo de Venta, en la columna izquierda).
+            # Aprovechamos esa estructura solo para enriquecer el dato opcional:
+            # nunca dependemos de ella para interpretar SKU, cantidades o ventas.
+            if "productos" in page_text.lower() and re.search(r"identifi", page_text, re.IGNORECASE):
+                try:
+                    left_text = page.crop(
+                        (0, 0, page.width * 0.38, page.height)
+                    ).extract_text() or ""
+                    left_lines = [part.strip() for part in left_text.splitlines() if part.strip()]
+                    for index, left_line in enumerate(left_lines[:-1]):
+                        match_sale = sale_re.search(left_line)
+                        if not match_sale:
+                            continue
+                        candidate = left_lines[index + 1].strip()
+                        # No interpretar como comprador códigos de envío ni campos
+                        # de un formato diferente al Control de dos columnas.
+                        if (candidate and len(candidate) <= 120
+                                and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", candidate)
+                                and not re.match(r"^[A-Z0-9]{10,}$", candidate)
+                                and not re.match(
+                                    r"^(?:Venta|Pack\s*ID|SKU|Cantidad|Identifi|Productos)\b",
+                                    candidate, re.IGNORECASE,
+                                )):
+                            buyer_by_order[match_sale.group(1)] = candidate
+                except Exception:
+                    # Si la extracción geométrica falla, Picking sigue operativo
+                    # con Venta/SKU/Cantidad y comprador vacío.
+                    pass
+
+            # Un archivo parcialmente interpretado NO debe generar trabajo de picking.
+            if waiting_skus:
+                issues.append(f"página {page_no}: {len(waiting_skus)} SKU sin cantidad")
+            if waiting_qty:
+                issues.append(f"página {page_no}: {len(waiting_qty)} cantidades sin SKU")
+            if items_before_sale:
+                issues.append(f"página {page_no}: productos sin número de venta")
+
+    if empty_pages:
+        prefix = ", ".join(map(str, empty_pages[:8]))
+        raise ValueError(
+            f"No se puede importar: páginas sin texto reconocible ({prefix}). "
+            "Puede tratarse de un PDF escaneado; exporta el Control PDF original con texto."
+        )
+
+    if not seen_orders:
+        raise ValueError(
+            "No se encontraron números 'Venta:' en el PDF. "
+            "Se necesita el Control/Manifiesto con Venta, SKU y Cantidad por artículo; "
+            "un manifiesto de solo envíos o etiquetas sin detalle no permite generar Picking."
+        )
+
+    completed_orders = {r["ml_order_id"] for r in records}
+    missing_orders = sorted(seen_orders - completed_orders)
+    if missing_orders:
+        issues.append(
+            f"{len(missing_orders)} ventas sin productos y cantidades identificables "
+            f"(por ejemplo: {', '.join(missing_orders[:3])})"
+        )
+    if issues:
+        raise ValueError(
+            "No se creó ninguna OT: faltan datos o el formato del PDF no se reconoce "
+            "por completo. " + "; ".join(issues[:8]) +
+            ". Usa el Excel de ventas o comparte un ejemplo del PDF para adaptar su formato."
+        )
+
+    if not records:
+        raise ValueError("No se identificaron productos con SKU y Cantidad en el PDF.")
+
+    result = pd.DataFrame(records, columns=columns)
+    result["buyer"] = result.apply(
+        lambda r: buyer_by_order.get(r["ml_order_id"], r["buyer"]), axis=1
+    )
+    result["qty"] = result["qty"].astype(int)
+    # Cada pareja venta-SKU mantiene el total real. Si un SKU se repite dentro
+    # de la misma venta, sus cantidades se SUMAN, nunca se sobrescriben.
+    result = (result.groupby(["ml_order_id", "sku_ml"], sort=False, as_index=False)
+                    .agg({"buyer": "first", "title_ml": "first", "qty": "sum"}))
+    result = result[columns]
+    return result
+
+
+@st.cache_data(show_spinner=False)
+def _cached_parse_manifest_pdf(pdf_content: bytes) -> pd.DataFrame:
+    """Evita releer un manifiesto grande en cada rerun de Streamlit."""
+    return parse_manifest_pdf(pdf_content)
 
 
 # =========================
@@ -3942,7 +4057,7 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
                     b.metric("OTs abiertas", int(batch.get('open_ots', 0) or 0))
         st.divider()
 
-    origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
+    origen = st.radio("Origen", ["Excel Mercado Libre", "Control/Manifiesto PDF"], horizontal=True)
     num_pickers = st.number_input("Cantidad de pickeadores nuevos para esta carga", min_value=1, max_value=20, value=3 if batches else 5, step=1)
     model_pick = st.radio("Elegir modelo", ["Por ventas", "Por sku"], horizontal=True)
 
@@ -3958,12 +4073,50 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
         source_label = getattr(file, "name", "Excel ML")
         sales_df = import_sales_excel(file)
     else:
-        pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ml_pdf")
-        if not pdf_file:
-            st.info("Sube el PDF.")
+        pdf_files = st.file_uploader(
+            "Control/Manifiesto Mercado Libre (PDF)",
+            type=["pdf"], accept_multiple_files=True, key="ml_pdf",
+            help="Puedes elegir uno o varios PDF que contengan Venta, SKU y Cantidad."
+        )
+        if not pdf_files:
+            st.info("Sube el Control PDF de Mercado Libre con Venta, SKU y Cantidad por producto.")
             return
-        source_label = getattr(pdf_file, "name", "Manifiesto PDF")
-        sales_df = parse_manifest_pdf(pdf_file)
+        try:
+            with st.spinner("Leyendo y validando el contenido de los PDF..."):
+                pdf_dfs = [_cached_parse_manifest_pdf(pdf_file.getvalue()) for pdf_file in pdf_files]
+                # No mezclar dos archivos que repitan una misma venta: podría
+                # duplicar sus cantidades al sumar SKU.
+                ids_seen = set()
+                for pdf_file, pdf_df in zip(pdf_files, pdf_dfs):
+                    ids_in_file = set(pdf_df["ml_order_id"].astype(str))
+                    repeated = ids_seen.intersection(ids_in_file)
+                    if repeated:
+                        raise ValueError(
+                            f"La venta {sorted(repeated)[0]} aparece en más de un PDF. "
+                            "Quita los documentos repetidos para evitar duplicar unidades."
+                        )
+                    ids_seen.update(ids_in_file)
+                sales_df = pd.concat(pdf_dfs, ignore_index=True)
+        except Exception as exc:
+            st.error(f"No se pudieron validar los PDF: {exc}")
+            st.info("No se modificó ninguna tanda ni OT. El Excel de ventas sigue disponible.")
+            return
+
+        source_label = ", ".join(file.name for file in pdf_files)
+        # El manifiesto suele traer solo SKU; se completa el título desde Kame.
+        sales_df["title_ml"] = sales_df["sku_ml"].map(inv_map_sku).fillna("")
+        st.success(
+            f"PDF validado: {sales_df['ml_order_id'].nunique()} ventas, "
+            f"{len(sales_df)} líneas de productos y {int(sales_df['qty'].sum())} unidades."
+        )
+        unknown_skus = sorted(set(sales_df["sku_ml"]) - set(inv_map_sku))
+        if unknown_skus:
+            st.warning(
+                f"{len(unknown_skus)} SKU no aparecen en el maestro Kame: "
+                + ", ".join(unknown_skus[:12])
+                + ("..." if len(unknown_skus) > 12 else "")
+                + ". Revisa estos códigos antes de crear OTs."
+            )
 
     st.subheader("Vista previa")
     st.dataframe(sales_df.head(30))

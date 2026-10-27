@@ -1,0 +1,59 @@
+FERRETERÍA AURORA — VALIDACIÓN DE CARGA DE PICKING DESDE PDF
+27-10-2026
+
+Documento de prueba: Control(20261027-180906).pdf (no incluido en el paquete por contener información de compradores)
+
+1) COMPARACIÓN INDEPENDIENTE CON PDF REAL
+- Páginas: 5.
+- Ventas identificadas: 50 de 50.
+- Líneas SKU: 64 de 64.
+- Cantidades físicas de unidades declaradas: 77 de 77.
+- Compradores detectados en versión corregida: 50 de 50.
+- Referencias SKU diferentes: 56.
+- Conteo por página (ventas, líneas, unidades):
+  P1: 10, 14, 19
+  P2:  9, 13, 18
+  P3: 11, 14, 15
+  P4:  9, 12, 12
+  P5: 11, 11, 13
+
+2) MAESTRO SKU / CORTES
+- Único SKU del PDF ausente del maestro: 900601302025 (adaptador enchufe europeo/chileno).
+- En total, 55 de los 56 SKU distintos sí aparecen en maestro.
+- El programa emite una advertencia visible antes de crear OTs. No genera título técnico desde Kame para el SKU ausente.
+- Hay SKU clasificados para CORTES; con los datos del proyecto se derivan 4 unidades a cortes y 73 al picking PDA.
+
+3) ENSAYOS CON BASE SQLITE DE PRUEBA TEMPORAL, SIN ACCESO A PRODUCCIÓN
+- Reparto 'Por ventas' y 'Por SKU/familia': 1, 3, 5 y 8 pickeadores.
+- Se crearon en cada caso 50 ventas, 77 unidades en order_items y la cantidad correcta de OTs.
+- Las 77 unidades se distribuyeron en 73 para picking y 4 para cortes, sin pérdidas.
+- En reparto por SKU/familia no se repitió el mismo SKU entre diferentes pickeadores.
+- Reimportar las mismas 50 ventas devuelve 'duplicate' y no crea nuevas OTs.
+- Añadir una venta nueva junto a otras ya importadas creó solo la nueva venta con 3 OTs nuevas.
+
+4) PRUEBAS PDF POR LOTES
+- El PDF de 5 páginas se dividió en 5 PDF independientes para ensayo.
+- Se pudieron extraer y unificar los resultados sin perder líneas ni cantidades.
+- La comprobación de IDs repetidos identifica documentos duplicados.
+
+5) PRUEBAS AUTOMATIZADAS
+- 16 casos unitarios de extracción, pedidos con varios SKU, pack ID,
+  unidades, comprador sin etiqueta, archivos no-PDF e importación parcial rechazada.
+- Resultado: 16/16 PASAN.
+- Sintaxis de app.py: correcta.
+
+CAMBIO ADICIONAL EN ESTA VERSIÓN
+- El lector conserva el nombre del comprador extraído de la columna izquierda
+  de los Control PDF reales, sin alterar la lógica de ventas/SKU/cantidades.
+
+LIMITACIONES
+- No se probó el despliegue en Streamlit ni la interfaz real de PDA desde un navegador.
+- No se probó la conectividad con Google Sheets, Kame ni la plataforma ML.
+- No se ha probado un PDF escaneado; esos documentos se rechazan intencionalmente.
+- No se alteraron bases operativas ni respaldos remotos.
+
+COMANDOS
+python -m unittest discover -s tests -v
+
+IMPORTANTE
+Probar primero en una instancia aislada de la app, sin conectarla a la base SQLite de producción.
