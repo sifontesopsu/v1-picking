@@ -2603,8 +2603,11 @@ def load_cortes_set(path: str = CORTES_FILE) -> set:
 def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     """Convierte un Control/Manifiesto de ML en las mismas filas que el Excel de Picking.
 
-    Soporta Venta, SKU y Cantidad en líneas distintas o en diferente orden,
-    múltiples ítems y ventas por página. No usa las funciones ni tablas de Sorting.
+    Soporta documentos históricos con Venta: (Order ID) y documentos nuevos
+    con Envio:/Envío: (Shipment ID). Para no confundir identificadores,
+    almacena el segundo como referencia operativa SHIPMENT:<número> dentro
+    de ml_order_id (columna histórica del WMS), sin fingir que es Order ID.
+    Soporta múltiples SKU y envíos por página; no usa código de Sorting.
 
     SEGURIDAD OPERATIVA: un PDF escaneado, sin detalle de productos o con
     cantidades/SKU sin identificar se rechaza COMPLETO; nunca genera OTs parciales.
@@ -2624,11 +2627,17 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     if not content or not content.lstrip().startswith(b"%PDF-"):
         raise ValueError("El archivo no es un PDF válido.")
 
-    # Se leen exclusivamente marcadores explícitos. Los números de envío,
-    # códigos de barras y IDs de pack NO son automáticamente números de venta.
+    # Solo IDs identificados mediante un rótulo explícito. Ni Pack ID,
+    # ni el código de barras, ni el sender_id sirven como identificador.
+    # SHIPMENT: es un espacio de nombres distinto del Order ID histórico.
     sale_re = re.compile(
         r"\b(?:Venta|N[°ºo.]?\s*de\s*venta|N[uú]mero\s+de\s+venta|"
         r"ID\s+de\s+venta|Pedido|N[uú]mero\s+de\s+pedido)\s*[:#=-]?\s*#?\s*(\d{8,20})\b",
+        re.IGNORECASE,
+    )
+    shipment_re = re.compile(
+        r"\b(?:Env[ií]o|N[uú]mero\s+de\s+env[ií]o|Shipment\s*(?:ID)?)"
+        r"\s*[:#=-]\s*#?\s*(\d{8,20})\b",
         re.IGNORECASE,
     )
     sku_re = re.compile(
@@ -2645,7 +2654,8 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
 
     columns = ["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"]
     records = []
-    seen_orders = set()
+    seen_refs = set()
+    seen_types = set()
     buyer_by_order = {}
     issues = []
     empty_pages = []
@@ -2682,7 +2692,8 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
                 # Extraer todas las entidades con su posición real: ML puede
                 # ubicar 'SKU: ...' ANTES de 'Venta: ... Cantidad: ...'.
                 events = []
-                for pattern, kind in ((sale_re, "SALE"), (sku_re, "SKU"), (qty_re, "QTY"),
+                for pattern, kind in ((sale_re, "SALE"), (shipment_re, "SHIPMENT"),
+                                      (sku_re, "SKU"), (qty_re, "QTY"),
                                       (pack_re, "PACK")):
                     for match in pattern.finditer(line):
                         events.append((match.start(), kind, match.group(1)))
@@ -2703,12 +2714,16 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
                             current_buyer = ""
                         current_pack = value
 
-                    elif kind == "SALE":
-                        if current_order != value:
-                            current_order = value
-                            current_buyer = buyer_by_order.get(value, "")
-                        seen_orders.add(value)
-                        # SKU+Cantidad que preceden al primer 'Venta:'.
+                    elif kind in ("SALE", "SHIPMENT"):
+                        # Los envíos pueden agrupar varias órdenes. La referencia
+                        # de la tarea es el Shipment ID, no un Order ID inventado.
+                        ref = value if kind == "SALE" else f"SHIPMENT:{value}"
+                        if current_order != ref:
+                            current_order = ref
+                            current_buyer = buyer_by_order.get(ref, "")
+                        seen_refs.add(ref)
+                        seen_types.add(kind)
+                        # SKU+Cantidad que preceden al primer marcador ID.
                         if items_before_sale:
                             for sku, qty in items_before_sale:
                                 records.append({"ml_order_id": current_order, "buyer": current_buyer,
@@ -2756,7 +2771,7 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
             # (texto ubicado debajo de Venta, en la columna izquierda).
             # Aprovechamos esa estructura solo para enriquecer el dato opcional:
             # nunca dependemos de ella para interpretar SKU, cantidades o ventas.
-            if "productos" in page_text.lower() and re.search(r"identifi", page_text, re.IGNORECASE):
+            if re.search(r"\bProductos?\b", page_text, re.IGNORECASE) and re.search(r"identifi", page_text, re.IGNORECASE):
                 try:
                     left_text = page.crop(
                         (0, 0, page.width * 0.38, page.height)
@@ -2764,7 +2779,8 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
                     left_lines = [part.strip() for part in left_text.splitlines() if part.strip()]
                     for index, left_line in enumerate(left_lines[:-1]):
                         match_sale = sale_re.search(left_line)
-                        if not match_sale:
+                        match_ship = shipment_re.search(left_line)
+                        if not match_sale and not match_ship:
                             continue
                         candidate = left_lines[index + 1].strip()
                         # No interpretar como comprador códigos de envío ni campos
@@ -2773,10 +2789,11 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
                                 and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", candidate)
                                 and not re.match(r"^[A-Z0-9]{10,}$", candidate)
                                 and not re.match(
-                                    r"^(?:Venta|Pack\s*ID|SKU|Cantidad|Identifi|Productos)\b",
+                                    r"^(?:Venta|Env[ií]o|Pack\s*ID|SKU|Cantidad|Identifi|Productos)\b",
                                     candidate, re.IGNORECASE,
                                 )):
-                            buyer_by_order[match_sale.group(1)] = candidate
+                            ref = match_sale.group(1) if match_sale else f"SHIPMENT:{match_ship.group(1)}"
+                            buyer_by_order[ref] = candidate
                 except Exception:
                     # Si la extracción geométrica falla, Picking sigue operativo
                     # con Venta/SKU/Cantidad y comprador vacío.
@@ -2788,7 +2805,7 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
             if waiting_qty:
                 issues.append(f"página {page_no}: {len(waiting_qty)} cantidades sin SKU")
             if items_before_sale:
-                issues.append(f"página {page_no}: productos sin número de venta")
+                issues.append(f"página {page_no}: productos sin referencia Venta/Envio")
 
     if empty_pages:
         prefix = ", ".join(map(str, empty_pages[:8]))
@@ -2797,18 +2814,24 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
             "Puede tratarse de un PDF escaneado; exporta el Control PDF original con texto."
         )
 
-    if not seen_orders:
+    if not seen_refs:
         raise ValueError(
-            "No se encontraron números 'Venta:' en el PDF. "
-            "Se necesita el Control/Manifiesto con Venta, SKU y Cantidad por artículo; "
-            "un manifiesto de solo envíos o etiquetas sin detalle no permite generar Picking."
+            "No se encontraron números 'Venta:' ni identificadores 'Envio:' en el PDF. "
+            "Se necesita el Control con referencia, SKU y Cantidad por producto; "
+            "un archivo de etiquetas sin detalle no permite generar Picking."
+        )
+    if len(seen_types) > 1:
+        raise ValueError(
+            "El PDF mezcla referencias Venta (Order ID) y Envio (Shipment ID). "
+            "No se puede deduplicar con seguridad sin una relación explícita "
+            "Shipment-Order. Importa un Control homogéneo."
         )
 
     completed_orders = {r["ml_order_id"] for r in records}
-    missing_orders = sorted(seen_orders - completed_orders)
+    missing_orders = sorted(seen_refs - completed_orders)
     if missing_orders:
         issues.append(
-            f"{len(missing_orders)} ventas sin productos y cantidades identificables "
+            f"{len(missing_orders)} {'ventas' if seen_types == {'SALE'} else 'envíos'} sin productos y cantidades identificables "
             f"(por ejemplo: {', '.join(missing_orders[:3])})"
         )
     if issues:
@@ -3009,6 +3032,58 @@ def _build_picking_batch_label(source_label: str | None, model: str, picker_name
     return f"{src} · {model_txt} · {picks}"
 
 
+def _picking_reference_detail(sales_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per identifier in the input; an identifier is NOT always an order.
+
+    SKU lines and physical units are deliberately different metrics. Shipment
+    controls do not expose original Order IDs, so true sale count is unknown.
+    """
+    columns = ["ml_order_id", "buyer", "lineas_sku", "sku_distintos", "unidades"]
+    if sales_df is None or sales_df.empty:
+        return pd.DataFrame(columns=columns)
+    work = sales_df.copy()
+    work["ml_order_id"] = work["ml_order_id"].astype(str).str.strip()
+    work["sku_ml"] = work["sku_ml"].astype(str).str.strip()
+    work["qty"] = pd.to_numeric(work["qty"], errors="raise").astype(int)
+    if "buyer" not in work.columns:
+        work["buyer"] = ""
+    return (work.groupby("ml_order_id", sort=False, as_index=False)
+                .agg(buyer=("buyer", "first"),
+                     lineas_sku=("sku_ml", "size"),
+                     sku_distintos=("sku_ml", "nunique"),
+                     unidades=("qty", "sum")))[columns]
+
+
+def _picking_batch_reference_counts(conn, batch_key: str) -> dict:
+    """Distinct references + item lines without fan-out from joined picking tasks.
+
+    Uses the existing order and order_items tables without altering schema.
+    Does not treat SHIPMENT:<id> as an original Mercado Libre Order ID.
+    """
+    row = conn.execute("""
+        SELECT COUNT(DISTINCT refs.order_id),
+               COUNT(DISTINCT CASE WHEN refs.ml_order_id LIKE 'SHIPMENT:%' THEN refs.order_id END),
+               COUNT(DISTINCT CASE WHEN refs.ml_order_id NOT LIKE 'SHIPMENT:%' THEN refs.order_id END),
+               COUNT(oi.id), COALESCE(SUM(oi.qty), 0)
+        FROM (
+            SELECT DISTINCT o.id AS order_id, o.ml_order_id
+            FROM picking_ots po
+            JOIN ot_orders oo ON oo.ot_id = po.id
+            JOIN orders o ON o.id = oo.order_id
+            WHERE COALESCE(po.batch_key, po.ot_code, 'SIN_LOTE') = ?
+        ) refs
+        LEFT JOIN order_items oi ON oi.order_id = refs.order_id
+    """, (str(batch_key),)).fetchone() or (0, 0, 0, 0, 0)
+    total, shipments, sales, lines, units = (int(x or 0) for x in row)
+    return {
+        "orders_count": total,
+        "shipment_count": shipments,
+        "sale_count": sales,
+        "line_count": lines,
+        "unit_count": units,
+    }
+
+
 def _get_picking_batches_summary() -> list[dict]:
     conn = get_conn()
     c = conn.cursor()
@@ -3037,13 +3112,14 @@ def _get_picking_batches_summary() -> list[dict]:
             done_tasks = int(done_tasks or 0)
             total_tasks = pending_tasks + done_tasks
             pct = 0.0 if total_tasks == 0 else round((done_tasks * 100.0) / total_tasks, 1)
+            reference_counts = _picking_batch_reference_counts(conn, batch_key)
             rows.append({
                 "batch_key": str(batch_key),
                 "batch_label": str(batch_label or "Lote"),
                 "created_at": created_at,
                 "pickers": str(pickers or ""),
                 "ots": int(ots or 0),
-                "orders_count": int(orders_count or 0),
+                **reference_counts,
                 "pending_tasks": pending_tasks,
                 "done_tasks": done_tasks,
                 "total_tasks": total_tasks,
@@ -4052,9 +4128,16 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
                     st.progress(min(max(pct / 100.0, 0.0), 1.0))
                     st.caption(f"{done}/{total} tareas resueltas · {pct:.1f}%")
                     st.write(f"**Pickeadores:** {batch.get('pickers') or '-'}")
-                    a, b = st.columns(2)
-                    a.metric("Ventas", int(batch.get('orders_count', 0) or 0))
-                    b.metric("OTs abiertas", int(batch.get('open_ots', 0) or 0))
+                    a, b, c = st.columns(3)
+                    ship_count = int(batch.get('shipment_count', 0) or 0)
+                    sale_count = int(batch.get('sale_count', 0) or 0)
+                    ref_caption = "Envíos" if ship_count and not sale_count else (
+                        "Ventas / paquetes" if sale_count and not ship_count else "Referencias"
+                    )
+                    a.metric(ref_caption, int(batch.get('orders_count', 0) or 0))
+                    b.metric("Líneas SKU", int(batch.get('line_count', 0) or 0))
+                    c.metric("Unidades", int(batch.get('unit_count', 0) or 0))
+                    st.caption(f"OTs abiertas: {int(batch.get('open_ots', 0) or 0)}")
         st.divider()
 
     origen = st.radio("Origen", ["Excel Mercado Libre", "Control/Manifiesto PDF"], horizontal=True)
@@ -4076,10 +4159,10 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
         pdf_files = st.file_uploader(
             "Control/Manifiesto Mercado Libre (PDF)",
             type=["pdf"], accept_multiple_files=True, key="ml_pdf",
-            help="Puedes elegir uno o varios PDF que contengan Venta, SKU y Cantidad."
+            help="Puedes cargar varios Control PDF antiguos (Venta:) o nuevos (Envio:), con SKU y Cantidad."
         )
         if not pdf_files:
-            st.info("Sube el Control PDF de Mercado Libre con Venta, SKU y Cantidad por producto.")
+            st.info("Sube los Control PDF con Venta: o Envio:, además de SKU y Cantidad por producto.")
             return
         try:
             with st.spinner("Leyendo y validando el contenido de los PDF..."):
@@ -4096,6 +4179,18 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
                             "Quita los documentos repetidos para evitar duplicar unidades."
                         )
                     ids_seen.update(ids_in_file)
+                # No mezclar referencias de distinto tipo: el mismo paquete
+                # podría estar duplicado en formato viejo y nuevo.
+                ref_types = {
+                    "SHIPMENT" if str(ref).startswith("SHIPMENT:") else "SALE"
+                    for pdf_df in pdf_dfs for ref in pdf_df["ml_order_id"].astype(str)
+                }
+                if len(ref_types) > 1:
+                    raise ValueError(
+                        "La carga contiene PDFs con Venta: y otros con Envio:. "
+                        "No es seguro deduplicar órdenes contra envíos sin equivalencias. "
+                        "Cárgalos por separado y evita incluir ventas repetidas."
+                    )
                 sales_df = pd.concat(pdf_dfs, ignore_index=True)
         except Exception as exc:
             st.error(f"No se pudieron validar los PDF: {exc}")
@@ -4105,10 +4200,45 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
         source_label = ", ".join(file.name for file in pdf_files)
         # El manifiesto suele traer solo SKU; se completa el título desde Kame.
         sales_df["title_ml"] = sales_df["sku_ml"].map(inv_map_sku).fillna("")
-        st.success(
-            f"PDF validado: {sales_df['ml_order_id'].nunique()} ventas, "
-            f"{len(sales_df)} líneas de productos y {int(sales_df['qty'].sum())} unidades."
+        is_shipment_pdf = sales_df["ml_order_id"].astype(str).str.startswith("SHIPMENT:").all()
+        reference_name = "envíos (Shipment ID)" if is_shipment_pdf else "ventas (Order ID)"
+        refs_detail = _picking_reference_detail(sales_df)
+        ref_count = len(refs_detail)
+        line_count = len(sales_df)
+        unit_count = int(sales_df["qty"].sum())
+        st.success("Los documentos PDF se leyeron correctamente.")
+        a, b, c = st.columns(3)
+        a.metric("Envíos (Shipment ID)" if is_shipment_pdf else "Ventas (Order ID)", ref_count)
+        b.metric("Líneas de SKU", line_count)
+        c.metric("Unidades", unit_count)
+        st.caption(
+            "Cada línea es un producto SKU dentro de una referencia y puede tener más de una unidad. "
+            "Una referencia puede contener varias líneas de producto."
         )
+        if is_shipment_pdf:
+            st.caption("En el reparto 'Por ventas', cada Shipment ID se asigna como una referencia de envío completa.")
+            if ref_count == line_count:
+                st.info(
+                    "En estos PDF se detectó una línea SKU por cada Shipment ID. "
+                    "Que ambas cifras sean iguales no demuestra un error ni indica la cantidad real de ventas. "
+                    "Para contar ventas originales hace falta la correspondencia Order ID / Shipment ID."
+                )
+            else:
+                st.info(
+                    "Algunos envíos contienen varias líneas SKU. "
+                    "Estos documentos permiten contar envíos, pero no ventas originales "
+                    "sin una relación entre Order ID y Shipment ID."
+                )
+        with st.expander("Ver desglose por envío / venta", expanded=False):
+            st.dataframe(refs_detail, use_container_width=True, hide_index=True)
+        if is_shipment_pdf:
+            st.info(
+                "Este Control identifica ENVIOS, no números originales de venta. "
+                "El WMS guardará referencias SHIPMENT:<ID> para evitar confundirlas "
+                "con Order ID/Pack ID. No mezcles estas mismas ventas con un Excel "
+                "u otro manifiesto antiguo: sin equivalencias no se pueden "
+                "detectar duplicados entre identificadores diferentes."
+            )
         unknown_skus = sorted(set(sales_df["sku_ml"]) - set(inv_map_sku))
         if unknown_skus:
             st.warning(
@@ -4117,6 +4247,36 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
                 + ("..." if len(unknown_skus) > 12 else "")
                 + ". Revisa estos códigos antes de crear OTs."
             )
+
+    # Guardarraíl: un Shipment ID no equivale a Order ID/Pack ID.
+    # Sin un cruce oficial, no podemos detectar que ambas fuentes representen
+    # la misma venta, por lo que nunca se combinan en una tanda activa.
+    if batches:
+        incoming_types = {
+            "SHIPMENT" if str(ref).startswith("SHIPMENT:") else "SALE"
+            for ref in sales_df["ml_order_id"].astype(str)
+        }
+        conn_refs = get_conn()
+        try:
+            active_refs = [str(r[0] or "") for r in conn_refs.execute(
+                "SELECT DISTINCT o.ml_order_id FROM ot_orders oo "
+                "JOIN orders o ON o.id=oo.order_id"
+            ).fetchall()]
+        finally:
+            conn_refs.close()
+        active_types = {
+            "SHIPMENT" if ref.startswith("SHIPMENT:") else "SALE"
+            for ref in active_refs if ref
+        }
+        if active_types and incoming_types != active_types:
+            st.error(
+                "La tanda activa usa identificadores de otro tipo "
+                "(Order ID/Pack ID frente a Shipment ID). "
+                "Sin un cruce oficial entre ellos no se puede garantizar que "
+                "las ventas sean distintas. No se creó ninguna OT. "
+                "Finaliza la tanda actual o utiliza documentos con el mismo tipo de referencia."
+            )
+            return
 
     st.subheader("Vista previa")
     st.dataframe(sales_df.head(30))
@@ -4837,20 +4997,27 @@ def page_admin():
     c = conn.cursor()
 
     st.subheader("Resumen")
-    c.execute("SELECT COUNT(*) FROM orders")
-    n_orders = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM order_items")
-    n_items = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM orders WHERE ml_order_id NOT LIKE 'SHIPMENT:%'")
+    n_sales = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM orders WHERE ml_order_id LIKE 'SHIPMENT:%'")
+    n_shipments = c.fetchone()[0]
+    c.execute("SELECT COUNT(*), COALESCE(SUM(qty), 0) FROM order_items")
+    n_items, n_units = c.fetchone()
     c.execute("SELECT COUNT(*) FROM picking_ots")
     n_ots = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM picking_incidences")
     n_inc = c.fetchone()[0]
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Ventas", n_orders)
-    col2.metric("Líneas", n_items)
-    col3.metric("OTs", n_ots)
-    col4.metric("Incidencias", n_inc)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Ventas (IDs anteriores)", n_sales)
+    col2.metric("Envíos (Shipment IDs)", n_shipments)
+    col3.metric("Líneas SKU", n_items)
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Unidades", n_units)
+    col5.metric("OTs", n_ots)
+    col6.metric("Incidencias", n_inc)
+    if n_shipments:
+        st.caption("Shipment ID identifica un envío: las ventas originales no se pueden contar a partir de este dato.")
 
     st.subheader("Estado OTs")
     c.execute("""
