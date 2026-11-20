@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-11-19 22:15:32",
-  "source_file": "inventariobodega_20-11-2026 01_09_14.xlsx",
+  "updated_at": "2026-11-19 22:21:21",
+  "source_file": "inventariobodega_20-11-2026 01_14_58.xlsx",
   "source_file_packs": "informeStockPacks.xlsx",
   "bodega": "BODEGA UNIVERSAL",
   "rows_read": 4840,
@@ -3883,7 +3883,7 @@
     "130803005000": 4,
     "130803005005": 7,
     "140302905005": 48,
-    "140302905000": 158,
+    "140302905000": 148,
     "140302902005": 74,
     "140302902000": 187,
     "140302904000": 19,
