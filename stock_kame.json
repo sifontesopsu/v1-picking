@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-11-20 06:33:27",
-  "source_file": "inventariobodega_20-11-2026 09_27_24.xlsx",
+  "updated_at": "2026-11-20 06:39:07",
+  "source_file": "inventariobodega_20-11-2026 09_33_04.xlsx",
   "source_file_packs": "informeStockPacks.xlsx",
   "bodega": "BODEGA UNIVERSAL",
   "rows_read": 4839,
@@ -5902,7 +5902,7 @@
     "400901003091": 5,
     "400901003051": 13,
     "400901003081": 11,
-    "400901003031": 35,
+    "400901003031": 34,
     "400901003006": 0,
     "400901003026": 8,
     "100707001011": 0,
